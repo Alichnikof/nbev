@@ -1,5 +1,6 @@
 import argparse
 import json
+import time
 from pathlib import Path
 
 import torch
@@ -8,7 +9,7 @@ import yaml
 from transformers import get_cosine_schedule_with_warmup
 
 from architectures import architecture_name, get_architecture
-from dataset import TASK_TYPES, QuestionDataset, load_questions
+from dataset import TASK_TYPES, LengthGroupedBatchSampler, QuestionDataset, load_questions
 from inference import autocast, evaluate, get_device, to_device
 from logger import RunLogger, load_trainable_weights
 
@@ -19,10 +20,15 @@ def make_loader(split, config, arch, device, shuffle):
     max_questions = data["max_train_questions"] if split == "train" else data["max_test_questions"]
     questions = load_questions(split, max_questions, config["seed"])
     dataset = QuestionDataset(questions, arch.encode_example, data["max_state_tokens"], data["max_choice_tokens"])
+    if shuffle and data.get("group_by_length", False):
+        # Batches of similar state length (characters are a good enough proxy for tokens): less padding
+        sampler = LengthGroupedBatchSampler([len(s) for s in questions["state"]], data["batch_size"], config["seed"])
+        batching = {"batch_sampler": sampler}
+    else:
+        batching = {"batch_size": data["batch_size"], "shuffle": shuffle}
     return torch.utils.data.DataLoader(
         dataset,
-        batch_size=data["batch_size"],
-        shuffle=shuffle,
+        **batching,
         collate_fn=arch.collate_fn,
         num_workers=data["num_workers"],
         persistent_workers=data["num_workers"] > 0,  # keep workers alive across epochs and validation passes
@@ -40,16 +46,28 @@ def resolve_checkpoint(resume):
     return path
 
 
-def validate(network, test_loader, device, logger, step, best_accuracy):
+SELECT_BY = ("accuracy", "loss")
+
+
+def validate(network, test_loader, device, logger, step, best_score):
+    """Evaluates and keeps checkpoints/best: highest accuracy, or lowest loss (NLL) with logging.select_by: loss.
+
+    best_score is "higher is better": the accuracy, or minus the loss."""
     metrics = evaluate(network, test_loader, device)
     logger.log(step, split=logger.config["data"].get("eval_split", "test"), **metrics)
-    if metrics["accuracy"] > best_accuracy:
-        best_accuracy = metrics["accuracy"]
+    select_by = logger.config["logging"].get("select_by", "accuracy")
+    score = metrics["accuracy"] if select_by == "accuracy" else -metrics["loss"]
+    if score > best_score:
+        best_score = score
         logger.save_checkpoint(network, name="best", step=step)
-    return metrics, best_accuracy
+    return metrics, best_score
 
 
 def train(config, run_name, resume=None):
+    """Trains one run from a config dict and returns its folder, runs/<run_name>-<timestamp>/.
+
+    Saves checkpoints/best (best on data.eval_split, see logging.select_by), checkpoints/final and metrics.jsonl.
+    """
     torch.manual_seed(config["seed"])
     device = get_device()
     resume_dir, resume_meta = None, {}
@@ -59,6 +77,9 @@ def train(config, run_name, resume=None):
         config = {**config, "resumed_from": str(resume_dir)}
     logger = RunLogger(config, run_name, device)
     model, optim, log = config["model"], config["optim"], config["logging"]
+    select_by = log.get("select_by", "accuracy")
+    if select_by not in SELECT_BY:
+        raise ValueError(f"logging.select_by must be one of {SELECT_BY}, got {select_by!r}")
 
     arch = get_architecture(config)
     print(f"Architecture: {architecture_name(config)} ({model['name']})")
@@ -87,10 +108,13 @@ def train(config, run_name, resume=None):
     total_steps = optim["epochs"] * (len(train_loader) // accum)
     scheduler = get_cosine_schedule_with_warmup(optimizer, int(optim["warmup_ratio"] * total_steps), total_steps)
 
+    print(f"{len(train_loader.dataset)} training questions -> {total_steps} optimizer steps")
     step = 0
-    best_accuracy = -1.0
+    best_score = -float("inf")
+    window_loss, window_correct, window_count = 0.0, 0, 0  # train metrics averaged since the last log line
+    start = time.time()
     if resume_dir and test_loader is not None:
-        _, best_accuracy = validate(network, test_loader, device, logger, step, best_accuracy)
+        _, best_score = validate(network, test_loader, device, logger, step, best_score)
     network.train()
     for epoch in range(optim["epochs"]):
         epoch_loss, epoch_correct, epoch_count = 0.0, 0, 0
@@ -108,6 +132,9 @@ def train(config, run_name, resume=None):
             epoch_loss += loss.item() * len(logits)
             epoch_correct += correct
             epoch_count += len(logits)
+            window_loss += loss.item() * len(logits)
+            window_correct += correct
+            window_count += len(logits)
             if micro % accum:
                 continue
 
@@ -116,16 +143,21 @@ def train(config, run_name, resume=None):
             scheduler.step()
             optimizer.zero_grad()
             step += 1
+            if step == 20:
+                per_step = (time.time() - start) / step
+                print(f"~{per_step:.1f} s/step -> about {per_step * (total_steps - step) / 60:.0f} min of training left (+ evaluations)")
 
             if step % log["log_every"] == 0:
                 lrs = {"lr_head": scheduler.get_last_lr()[1]}
                 if lora_params:
                     lrs["lr_backbone"] = scheduler.get_last_lr()[0]
-                logger.log(step, split="train", epoch=epoch, loss=loss.item(), accuracy=correct / len(logits), **lrs)
+                logger.log(step, split="train", epoch=epoch, loss=window_loss / window_count,
+                           accuracy=window_correct / window_count, **lrs)
+                window_loss, window_correct, window_count = 0.0, 0, 0
             if step % log["save_every"] == 0:
                 logger.save_checkpoint(network, name="latest", step=step)
             if test_loader is not None and step % log["eval_every"] == 0:
-                test_metrics, best_accuracy = validate(network, test_loader, device, logger, step, best_accuracy)
+                test_metrics, best_score = validate(network, test_loader, device, logger, step, best_score)
 
         logger.log(step, split="train_epoch", epoch=epoch, loss=epoch_loss / epoch_count,
                    accuracy=epoch_correct / epoch_count)
@@ -133,12 +165,13 @@ def train(config, run_name, resume=None):
     summary = {"final_train_loss": epoch_loss / epoch_count, "final_train_accuracy": epoch_correct / epoch_count}
     if test_loader is not None:
         if step % log["eval_every"] != 0:
-            test_metrics, best_accuracy = validate(network, test_loader, device, logger, step, best_accuracy)
+            test_metrics, best_score = validate(network, test_loader, device, logger, step, best_score)
         summary["test"] = test_metrics
-        summary["best_test_accuracy"] = best_accuracy
+        summary[f"best_test_{select_by}"] = best_score if select_by == "accuracy" else -best_score
 
     ckpt_dir = logger.save_checkpoint(network, step=step)
     logger.finish(checkpoint=str(ckpt_dir), **summary)
+    return logger.run_dir
 
 
 def main():

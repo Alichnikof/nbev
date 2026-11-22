@@ -1,6 +1,6 @@
 # Comparison run (Mac-sized). Every configs/compare/*.yaml uses the same data, questions per step and evaluation;
 # each model is trained the way it is meant to be: Qwen with LoRA (as in BEV), DeBERTa fully fine-tuned.
-# Run them all + calibration with: bash run_compare.sh
+# Run: uv run python train.py configs/compare/<name>.yaml --name cmp-<name>, then calibration.py on its best checkpoint
 seed: 0
 
 model:
@@ -16,6 +16,7 @@ data:
   max_choice_tokens: 64
   batch_size: 8                 # questions per micro-batch
   num_workers: 2
+  group_by_length: true         # batches of similar length: less padding
 
 lora:
   last_k_layers: 12
@@ -41,3 +42,4 @@ logging:
   log_every: 25
   eval_every: 125
   save_every: 1000000           # only best + final
+  select_by: loss               # best checkpoint = lowest validation NLL

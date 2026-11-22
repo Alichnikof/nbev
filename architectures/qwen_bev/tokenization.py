@@ -8,7 +8,7 @@ import os
 import torch
 from transformers import AutoTokenizer
 
-from architectures.prompts import context_prefix
+from architectures.prompts import context_prefix, keep_head_and_tail
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")  # the tokenizer is shared with DataLoader worker processes
 
@@ -119,8 +119,16 @@ def truncate(text, max_tokens):
     return tokenizer.decode(tokens[:max_tokens])
 
 
+def truncate_state(state, max_tokens):
+    # Long states lose their middle, not their end (the end holds the response being judged)
+    tokens = tokenizer.encode(state)
+    if len(tokens) <= max_tokens:
+        return state
+    return tokenizer.decode(keep_head_and_tail(tokens, max_tokens, tokenizer.encode(" ...")))
+
+
 def build_question(state, instructions, task_type, max_state_tokens):
-    return f"{context_prefix(instructions, task_type)}{truncate(state, max_state_tokens)}\n"
+    return f"{context_prefix(instructions, task_type)}{truncate_state(state, max_state_tokens)}\n"
 
 
 def encode_example(state, instructions, choices, task_type, max_state_tokens, max_choice_tokens):

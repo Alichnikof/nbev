@@ -1,5 +1,6 @@
 import hashlib
 import json
+import math
 
 import torch
 from datasets import load_dataset
@@ -68,6 +69,34 @@ def load_questions(split, max_questions=None, seed=0):
     if max_questions is not None:
         ds = ds.select(range(min(max_questions, len(ds))))
     return ds
+
+
+class LengthGroupedBatchSampler(torch.utils.data.Sampler):
+    """Shuffled batches of questions with similar state length (config data.group_by_length).
+
+    A batch is padded to its longest sequence, so mixing a 100-token state with a 450-token one wastes most
+    of the compute. The order is shuffled, cut into groups of `group_batches` batches, each group is sorted by
+    length and cut into batches, then the batches are shuffled. Batches still differ from step to step.
+    """
+
+    def __init__(self, lengths, batch_size, seed=0, group_batches=50):
+        self.lengths, self.batch_size, self.seed, self.group_batches = lengths, batch_size, seed, group_batches
+        self.epoch = 0
+
+    def __len__(self):
+        return math.ceil(len(self.lengths) / self.batch_size)
+
+    def __iter__(self):
+        generator = torch.Generator().manual_seed(self.seed + self.epoch)
+        self.epoch += 1
+        order = torch.randperm(len(self.lengths), generator=generator).tolist()
+        group_size = self.batch_size * self.group_batches
+        batches = []
+        for start in range(0, len(order), group_size):
+            group = sorted(order[start:start + group_size], key=self.lengths.__getitem__)
+            batches += [group[i:i + self.batch_size] for i in range(0, len(group), self.batch_size)]
+        for i in torch.randperm(len(batches), generator=generator).tolist():
+            yield batches[i]
 
 
 class QuestionDataset(torch.utils.data.Dataset):

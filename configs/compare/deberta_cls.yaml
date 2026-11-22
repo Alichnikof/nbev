@@ -16,6 +16,7 @@ data:
   max_choice_tokens: 64
   batch_size: 4                 # questions per micro-batch (~18 sequences)
   num_workers: 2
+  group_by_length: true         # batches of similar length: less padding
 
 lora:
   last_k_layers: 0              # unused with full_finetune
@@ -41,3 +42,4 @@ logging:
   log_every: 25
   eval_every: 125
   save_every: 1000000
+  select_by: loss               # best checkpoint = lowest validation NLL

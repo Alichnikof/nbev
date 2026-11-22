@@ -19,23 +19,28 @@ Open [`arch.ipynb`](arch.ipynb) for the architecture walkthrough from the livest
 - [`inference.py`](inference.py): evaluation and typed answers through `answer()`.
 - [`metrics.py`](metrics.py): per-task metrics: accuracy, NLL, P(yes) Brier score and AUC, expected-score MAE, ECE.
 - [`calibration.py`](calibration.py): post-training temperature scaling, one temperature per task type.
-- [`deberta_full_walkthrough.ipynb`](deberta_full_walkthrough.ipynb): our DeBERTa model end to end, from data to training, calibration, test and hands-on questions. It reuses a finished run instead of retraining.
-- [`compare_models.ipynb`](compare_models.ipynb): compares the `configs/compare/` runs on the same test questions. It never trains.
+- [`deberta_full_walkthrough.ipynb`](deberta_full_walkthrough.ipynb): our DeBERTa model end to end, from data to training, calibration, test and hands-on questions. It uses [`configs/deberta_walkthrough.yaml`](configs/deberta_walkthrough.yaml) and reuses a finished run instead of retraining.
+- [`notebook_utils.py`](notebook_utils.py): the notebook's helpers (train or reuse a run, cached evaluation, plots, `ask`).
 
 ## Architectures
 
 Pick an encoder with `model.architecture` and a decision head with `head.type`. Everything else is shared: data, prompt text, training loop, and metrics.
 
-| | `qwen_bev` (original) | `deberta_cross` |
-|---|---|---|
-| Backbone | Qwen3 decoder (causal) | DeBERTa-v3 encoder (bidirectional) |
-| Sequences per question | 1: `question+state <option>A</option><option>B</option>… The answer is:` | 1 per choice: `[CLS] question+state [SEP] choice [SEP]` |
-| Choice embedding | last token of each choice | `model.pooling`: `cls` or `choice_mean` |
-| Default head | `bilinear_answer` | `candidate_mlp` |
-| Cost | context encoded once | context encoded once per choice |
-| Code | [`architectures/qwen_bev/`](architectures/qwen_bev/) | [`architectures/deberta_cross/`](architectures/deberta_cross/) |
+| | `qwen_bev` (original) | `deberta_cross` | `nbev` |
+|---|---|---|---|
+| Backbone | Qwen3 decoder (causal) | DeBERTa-v3 encoder (bidirectional) | DeBERTa-v3 encoder (bidirectional) |
+| Sequences per question | 1: `question+state <option>A</option><option>B</option>… The answer is:` | 1 per choice: `[CLS] question+state [SEP] choice [SEP]` | 1: `[CLS] question+state [SEP] [OPT] A [SEP] [OPT] B [SEP] …` |
+| Choice order | invariant: choices share positions and are masked apart | invariant: one sequence per choice | invariant: choices share positions and are masked apart, as in BEV |
+| Choice embedding | last token of each choice | `model.pooling`: `cls` or `choice_mean` | `model.pooling`: `opt` (the `[OPT]` token), `mean` or `opt_mean` |
+| Default head | `bilinear_answer` | `candidate_mlp` | `candidate_mlp` |
+| Cost | context encoded once | context encoded once per choice | context encoded once (~3x faster than `deberta_cross`) |
+| Code | [`architectures/qwen_bev/`](architectures/qwen_bev/) | [`architectures/deberta_cross/`](architectures/deberta_cross/) | [`architectures/nbev/`](architectures/nbev/) |
 
-Decision heads ([`choice_head.py`](architectures/choice_head.py)) work with either encoder. In both, the candidates first attend to each other with no positional encoding, so the result doesn't depend on candidate order:
+`nbev` ("new BEV") is BEV's packing on a bidirectional encoder. Every choice restarts at the same position, which on its own makes a bidirectional encoder order-invariant. The attention mask lets a choice see only the context and itself, so each choice is read as if it were the only one. Without the mask, tokens of different choices would share positions and the encoder could not tell which choice a token belongs to: "not good" + "very bad" would be the same input as "very good" + "not bad". Its `[OPT]` token (DeBERTa's `[MASK]` token, reused) attends to all of the choice's tokens, so its output represents the whole choice however many tokens it has. DeBERTa-v3 only uses relative positions, so the shared positions are passed as a per-question relative-position matrix; [`network.py`](architectures/nbev/network.py) patches the attention layers to accept one matrix per question. `uv run python -m tests.test_nbev` checks order invariance, choice isolation, padding, and that the patch reproduces stock DeBERTa.
+
+Long states keep their first 64 tokens and their end; the middle is dropped (all architectures). States end with the `Response:` being judged, so cutting the end would hide it from the model.
+
+Decision heads ([`choice_head.py`](architectures/choice_head.py)) work with any encoder. In both, the candidates first attend to each other with no positional encoding, so the result doesn't depend on candidate order:
 
 - `bilinear_answer` (BEV): self-attention over `[task token, candidates…, answer]`, then each candidate is scored by a bilinear product with the answer slot. With `deberta_cross`, which has no answer token, the answer slot is a learned vector (`answer_query`).
 - `candidate_mlp` (ours): self-attention over the candidates only, then the same MLP turns each candidate into a logit. `head.num_layers: 0` scores each candidate independently.
@@ -44,11 +49,11 @@ Each package has a `tokenization.py` (`encode_example`, `collate_fn`) and a `net
 
 ### Comparing them
 
-[`configs/compare/`](configs/compare/) holds Mac-sized runs on identical data: 10K training questions, 448 state tokens, 16 questions per optimizer step. Qwen trains with LoRA as in BEV; DeBERTa is fully fine-tuned with `cls` or `choice_mean` pooling. One script trains them all, picks each best checkpoint on `validation`, and fits temperatures on `calibration`. Then open `compare_models.ipynb`:
+[`configs/compare/`](configs/compare/) holds Mac-sized runs on identical data: 10K training questions, 448 state tokens, 16 questions per optimizer step. Qwen trains with LoRA as in BEV; DeBERTa is fully fine-tuned, as a cross-encoder (`cls` or `choice_mean` pooling) or packed (`nbev.yaml`). They batch questions of similar length together (`data.group_by_length`) and keep the checkpoint with the lowest validation NLL (`logging.select_by: loss`; the default is `accuracy`). Each takes up to about an hour on an M5 Pro:
 
 ```bash
-bash run_compare.sh                 # all three, about 3 hours on an M5 Pro
-bash run_compare.sh deberta_mean    # or a subset
+uv run python train.py configs/compare/deberta_mean.yaml --name cmp-deberta-mean
+uv run python calibration.py runs/cmp-deberta-mean-<timestamp>/checkpoints/best
 ```
 
 Full-scale DeBERTa configs for a GPU: [`deberta_lora.yaml`](configs/deberta_lora.yaml) and [`deberta_full_ft.yaml`](configs/deberta_full_ft.yaml). Sanity check: [`deberta_smoke.yaml`](configs/deberta_smoke.yaml).

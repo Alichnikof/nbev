@@ -12,10 +12,16 @@ deberta_cross  DeBERTa encoder (bidirectional). ONE sequence per (question, choi
                The context is re-encoded for every choice (cross-encoder).
                Choice embedding = [CLS] or the mean of the choice tokens (config: model.pooling).
 
-Decision heads (head.type, see choice_head.py), usable with either encoder:
+nbev           "new BEV": DeBERTa encoder (bidirectional). ONE sequence per question, BEV-style:
+                   [CLS] question+state [SEP] [OPT] A [SEP] [OPT] B [SEP] ...
+               Choices share positions and are masked from each other, so the context is encoded once
+               and the result does not depend on choice order.
+               Choice embedding = the [OPT] token, the mean of the choice tokens, or both (config: model.pooling).
+
+Decision heads (head.type, see choice_head.py), usable with any encoder:
     bilinear_answer  BEV: choices attend to each other, then are scored against an "answer" embedding
     candidate_mlp    ours: choices attend to each other, then the same MLP scores each one
-Defaults: qwen_bev -> bilinear_answer, deberta_cross -> candidate_mlp.
+Defaults: qwen_bev -> bilinear_answer, deberta_cross and nbev -> candidate_mlp.
 
 Each architecture package exposes the same three functions:
     encode_example(state, instructions, choices, task_type, max_state_tokens, max_choice_tokens) -> dict
@@ -25,7 +31,7 @@ Each architecture package exposes the same three functions:
 """
 import importlib
 
-ARCHITECTURES = ("qwen_bev", "deberta_cross")
+ARCHITECTURES = ("qwen_bev", "deberta_cross", "nbev")
 DEFAULT_ARCHITECTURE = "qwen_bev"  # configs without model.architecture are the original BEV setup
 
 

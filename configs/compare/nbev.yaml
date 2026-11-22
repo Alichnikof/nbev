@@ -1,0 +1,47 @@
+# Comparison run (Mac-sized), see qwen_bev.yaml. nbev ("new BEV"): DeBERTa with BEV-style packing, fully fine-tuned, our candidate_mlp head.
+# One sequence per question: the choices share positions and are masked from each other, so the context is
+# encoded once (~3.5x fewer tokens than deberta_cross) and the result does not depend on choice order.
+seed: 0
+
+model:
+  architecture: nbev            # [CLS] context [SEP] [OPT] A [SEP] [OPT] B [SEP] ...
+  name: microsoft/deberta-v3-base
+  num_layers: null
+  pooling: opt                  # opt | mean | opt_mean: [OPT] token, mean of the choice tokens, or both
+  full_finetune: true
+
+data:
+  max_train_questions: 10000
+  max_test_questions: 1000
+  eval_split: validation
+  max_state_tokens: 448
+  max_choice_tokens: 64
+  batch_size: 8                 # questions per micro-batch (one sequence each)
+  num_workers: 2
+  group_by_length: true         # batches of similar length: less padding
+
+lora:
+  last_k_layers: 0              # unused with full_finetune
+  r: 8
+  alpha: 16
+  dropout: 0.0
+
+head:
+  type: candidate_mlp           # ours: candidate self-attention + shared MLP
+  new_dim: 512
+  num_layers: 2
+
+optim:
+  epochs: 1
+  lr_backbone: 3.0e-5           # full fine-tuning
+  lr_head: 1.0e-3
+  weight_decay: 0.01
+  warmup_ratio: 0.1
+  grad_clip: 1.0
+  grad_accum_steps: 2           # 8 x 2 = 16 questions per optimizer step
+
+logging:
+  log_every: 25
+  eval_every: 125
+  save_every: 1000000
+  select_by: loss               # best checkpoint = lowest validation NLL (we care about calibrated probabilities)

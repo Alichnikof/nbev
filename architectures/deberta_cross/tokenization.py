@@ -11,18 +11,24 @@ import os
 import torch
 from transformers import AutoTokenizer
 
-from architectures.prompts import context_prefix
+from architectures.prompts import context_prefix, keep_head_and_tail
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")  # the tokenizer is shared with DataLoader worker processes
 
 # deberta-v3-xsmall/small/base/large all share this SentencePiece vocabulary
 model_name = "microsoft/deberta-v3-base"
 tokenizer = AutoTokenizer.from_pretrained(model_name)
+GAP_IDS = tokenizer.encode(" ...", add_special_tokens=False)  # marks the dropped middle of a long state
+
+
+def encode_context(state, instructions, task_type, max_state_tokens):
+    """Task hint + question + state (long states lose their middle, see keep_head_and_tail)."""
+    state_ids = keep_head_and_tail(tokenizer.encode(state, add_special_tokens=False), max_state_tokens, GAP_IDS)
+    return tokenizer.encode(context_prefix(instructions, task_type), add_special_tokens=False) + state_ids
 
 
 def encode_example(state, instructions, choices, task_type, max_state_tokens, max_choice_tokens):
-    context_ids = (tokenizer.encode(context_prefix(instructions, task_type), add_special_tokens=False)
-                   + tokenizer.encode(state, add_special_tokens=False)[:max_state_tokens])
+    context_ids = encode_context(state, instructions, task_type, max_state_tokens)
 
     sequences, choice_spans = [], []
     for choice in choices:
