@@ -1,13 +1,23 @@
+import hashlib
 import json
 
 import torch
 from datasets import load_dataset
 
-from tokenization import encode_example, tokenizer
-
 DATASET_NAME = "avbiswas/bev-decision-150K"
 TASK_TYPES = {"choice": 0, "noul": 1, "score": 2}
 TASK_NAMES = {v: k for k, v in TASK_TYPES.items()}
+# ~4% of the dataset's train split is held out and cut in two halves (~5K questions each):
+#   validation   picks the best checkpoint during training
+#   calibration  fits the temperatures after training
+# The split is a hash of the state TEXT: some states appear in several rows, and hashing sends every
+# copy to the same split, so no state leaks between train, validation and calibration. Deterministic.
+HELDOUT_PER_MILLE = {"validation": range(0, 20), "calibration": range(20, 40)}  # buckets out of 1000
+SPLITS = ("train", "validation", "calibration", "test")
+
+
+def state_bucket(state):
+    return int(hashlib.md5(state.encode()).hexdigest(), 16) % 1000
 
 
 def question_to_choices(question):
@@ -41,7 +51,16 @@ def explode_questions(rows):
 
 
 def load_questions(split, max_questions=None, seed=0):
-    ds = load_dataset(DATASET_NAME, split=split).shuffle(seed=seed)
+    """split: one of SPLITS. validation and calibration are held out of the dataset's train split (see above)."""
+    if split not in SPLITS:
+        raise ValueError(f"split must be one of {SPLITS}, got {split!r}")
+    if split == "test":
+        ds = load_dataset(DATASET_NAME, split="test")
+    else:
+        heldout = range(0, 1000) if split == "train" else HELDOUT_PER_MILLE[split]
+        keep = (lambda b: b >= 40) if split == "train" else (lambda b: b in heldout)
+        ds = load_dataset(DATASET_NAME, split="train").filter(lambda row: keep(state_bucket(row["state"])))
+    ds = ds.shuffle(seed=seed)
     if max_questions is not None:
         # Every row has at least one question, so this many rows is always enough
         ds = ds.select(range(min(max_questions, len(ds))))
@@ -51,9 +70,12 @@ def load_questions(split, max_questions=None, seed=0):
     return ds
 
 
-class BEVDataset(torch.utils.data.Dataset):
-    def __init__(self, questions, max_state_tokens, max_choice_tokens):
+class QuestionDataset(torch.utils.data.Dataset):
+    """Architecture-agnostic: encode_fn is the selected architecture's encode_example."""
+
+    def __init__(self, questions, encode_fn, max_state_tokens, max_choice_tokens):
         self.questions = questions
+        self.encode_fn = encode_fn
         self.max_state_tokens = max_state_tokens
         self.max_choice_tokens = max_choice_tokens
 
@@ -62,48 +84,10 @@ class BEVDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         row = self.questions[idx]
-        example = encode_example(
+        example = self.encode_fn(
             row["state"], row["instructions"], row["choices"], TASK_NAMES[row["task_type"]],
             self.max_state_tokens, self.max_choice_tokens,
         )
         example["task_type"] = row["task_type"]
         example["label"] = row["label"]
         return example
-
-
-def collate_fn(batch):
-    B = len(batch)
-    L = max(len(ex["input_ids"]) for ex in batch)
-    C = max(len(ex["choice_read_idx"]) for ex in batch)
-
-    input_ids = torch.full((B, L), tokenizer.pad_token_id, dtype=torch.long)
-    position_ids = torch.zeros((B, L), dtype=torch.long)
-    # Padded query rows attend only to themselves, otherwise their softmax row is all -inf -> NaN
-    attention_mask = torch.eye(L).repeat(B, 1, 1)
-    choice_read_idx = torch.zeros((B, C), dtype=torch.long)
-    choice_mask = torch.zeros((B, C), dtype=torch.bool)
-    answer_end_idx = torch.zeros(B, dtype=torch.long)
-
-    for b, ex in enumerate(batch):
-        n, c = len(ex["input_ids"]), len(ex["choice_read_idx"])
-        input_ids[b, :n] = torch.tensor(ex["input_ids"])
-        position_ids[b, :n] = torch.tensor(ex["position_ids"])
-        attention_mask[b, :n, :n] = ex["attention_mask"]
-        choice_read_idx[b, :c] = torch.tensor(ex["choice_read_idx"])
-        choice_mask[b, :c] = True
-        answer_end_idx[b] = ex["answer_end_idx"]
-
-    attention_mask = torch.where(attention_mask == 0, -float("inf"), 0.0).unsqueeze(1)  # B, 1, L, L
-
-    out = {
-        "input_ids": input_ids,
-        "position_ids": position_ids,
-        "attention_mask": attention_mask,
-        "choice_read_idx": choice_read_idx,
-        "choice_mask": choice_mask,
-        "answer_end_idx": answer_end_idx,
-        "task_type": torch.tensor([ex["task_type"] for ex in batch], dtype=torch.long),
-    }
-    if all(ex["label"] is not None for ex in batch):
-        out["labels"] = torch.tensor([ex["label"] for ex in batch], dtype=torch.long)
-    return out

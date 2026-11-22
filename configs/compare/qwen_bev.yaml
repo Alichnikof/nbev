@@ -1,0 +1,43 @@
+# Comparison run (Mac-sized). Every configs/compare/*.yaml uses the same data, questions per step and evaluation;
+# each model is trained the way it is meant to be: Qwen with LoRA (as in BEV), DeBERTa fully fine-tuned.
+# Run them all + calibration with: bash run_compare.sh
+seed: 0
+
+model:
+  architecture: qwen_bev        # original BEV: Qwen decoder, one sequence per question
+  name: Qwen/Qwen3-0.6B
+  num_layers: 20
+
+data:
+  max_train_questions: 10000
+  max_test_questions: 1000      # caps the eval split below
+  eval_split: validation        # picks the best checkpoint; calibration and test stay untouched
+  max_state_tokens: 448         # same context budget for every model (DeBERTa-v3 was pretrained on 512 tokens)
+  max_choice_tokens: 64
+  batch_size: 8                 # questions per micro-batch
+  num_workers: 2
+
+lora:
+  last_k_layers: 12
+  r: 8
+  alpha: 16
+  dropout: 0.0
+
+head:
+  type: bilinear_answer         # BEV head
+  new_dim: 512
+  num_layers: 2
+
+optim:
+  epochs: 1
+  lr_backbone: 1.0e-4
+  lr_head: 1.0e-3
+  weight_decay: 0.01
+  warmup_ratio: 0.1
+  grad_clip: 1.0
+  grad_accum_steps: 2           # 8 x 2 = 16 questions per optimizer step
+
+logging:
+  log_every: 25
+  eval_every: 125
+  save_every: 1000000           # only best + final

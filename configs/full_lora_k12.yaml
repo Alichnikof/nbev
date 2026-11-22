@@ -3,6 +3,7 @@
 seed: 0
 
 model:
+  architecture: qwen_bev    # see architectures/__init__.py
   name: Qwen/Qwen3-0.6B
   num_layers: 20
 
@@ -21,6 +22,7 @@ lora:
   dropout: 0.0
 
 head:
+  type: bilinear_answer      # BEV head (candidate_mlp = ours)
   new_dim: 512
   num_layers: 2
 

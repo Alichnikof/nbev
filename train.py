@@ -5,25 +5,25 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 import yaml
-from peft import PeftModel, set_peft_model_state_dict
-from safetensors.torch import load_file
 from transformers import get_cosine_schedule_with_warmup
 
-from dataset import TASK_TYPES, BEVDataset, collate_fn, load_questions
+from architectures import architecture_name, get_architecture
+from dataset import TASK_TYPES, QuestionDataset, load_questions
 from inference import autocast, evaluate, get_device, to_device
-from logger import RunLogger
-from network import build_network
+from logger import RunLogger, load_trainable_weights
 
 
-def make_loader(split, config, device, shuffle):
+def make_loader(split, config, arch, device, shuffle):
     data = config["data"]
+    # max_test_questions caps whichever split is used for evaluation (data.eval_split)
     max_questions = data["max_train_questions"] if split == "train" else data["max_test_questions"]
-    dataset = BEVDataset(load_questions(split, max_questions, config["seed"]), data["max_state_tokens"], data["max_choice_tokens"])
+    questions = load_questions(split, max_questions, config["seed"])
+    dataset = QuestionDataset(questions, arch.encode_example, data["max_state_tokens"], data["max_choice_tokens"])
     return torch.utils.data.DataLoader(
         dataset,
         batch_size=data["batch_size"],
         shuffle=shuffle,
-        collate_fn=collate_fn,
+        collate_fn=arch.collate_fn,
         num_workers=data["num_workers"],
         persistent_workers=data["num_workers"] > 0,  # keep workers alive across epochs and validation passes
         pin_memory=device.type == "cuda",
@@ -40,23 +40,9 @@ def resolve_checkpoint(resume):
     return path
 
 
-def load_weights(network, ckpt_dir):
-    """Load LoRA + head weights into a trainable network with the same architecture."""
-    has_lora = (ckpt_dir / "lora").exists()
-    if has_lora != isinstance(network.backbone, PeftModel):
-        raise ValueError(f"{ckpt_dir} {'has' if has_lora else 'has no'} LoRA weights, but the config's lora.last_k_layers disagrees")
-    if has_lora:
-        weights = load_file(ckpt_dir / "lora" / "adapter_model.safetensors")
-        result = set_peft_model_state_dict(network.backbone, weights)
-        missing = [k for k in result.missing_keys if "lora_" in k]
-        if result.unexpected_keys or missing:
-            raise ValueError(f"LoRA weights don't match the config: unexpected={result.unexpected_keys[:3]} missing={missing[:3]}")
-    network.head.load_state_dict(torch.load(ckpt_dir / "head.pt", map_location="cpu"))
-
-
 def validate(network, test_loader, device, logger, step, best_accuracy):
     metrics = evaluate(network, test_loader, device)
-    logger.log(step, split="test", **metrics)
+    logger.log(step, split=logger.config["data"].get("eval_split", "test"), **metrics)
     if metrics["accuracy"] > best_accuracy:
         best_accuracy = metrics["accuracy"]
         logger.save_checkpoint(network, name="best", step=step)
@@ -72,27 +58,29 @@ def train(config, run_name, resume=None):
         resume_meta = json.loads((resume_dir / "meta.json").read_text())
         config = {**config, "resumed_from": str(resume_dir)}
     logger = RunLogger(config, run_name, device)
-    model, lora, optim, log = config["model"], config["lora"], config["optim"], config["logging"]
+    model, optim, log = config["model"], config["optim"], config["logging"]
 
-    head_config = {**config["head"], "num_task_types": len(TASK_TYPES)}
-    network = build_network(model["name"], model["num_layers"], lora["r"], lora["alpha"], lora["dropout"],
-                            lora["last_k_layers"], head_config)
+    arch = get_architecture(config)
+    print(f"Architecture: {architecture_name(config)} ({model['name']})")
+    network = arch.build_network(config, len(TASK_TYPES))
     if resume_dir:
-        load_weights(network, resume_dir)
-        print(f"Loaded LoRA + head weights from {resume_dir} (step {resume_meta['step']})")
+        load_trainable_weights(network, resume_dir)
+        print(f"Loaded trainable weights from {resume_dir} (step {resume_meta['step']})")
     network = network.to(device)
     count = lambda params: sum(p.numel() for p in params if p.requires_grad)
     print(f"trainable params: backbone={count(network.backbone.parameters()):,} head={count(network.head.parameters()):,}")
 
-    train_loader = make_loader("train", config, device, shuffle=True)
-    test_loader = None
+    train_loader = make_loader("train", config, arch, device, shuffle=True)
+    test_loader = None  # evaluation loader; its split is data.eval_split ("test" for the original configs)
     if config["data"]["max_test_questions"] != 0:
-        test_loader = make_loader("test", config, device, shuffle=False)
+        test_loader = make_loader(config["data"].get("eval_split", "test"), config, arch, device, shuffle=False)
 
+    # Two learning rates: backbone (LoRA adapters or full fine-tuning) and everything else (head, answer query)
     lora_params = [p for p in network.backbone.parameters() if p.requires_grad]
+    head_params = [p for n, p in network.named_parameters() if p.requires_grad and not n.startswith("backbone.")]
     optimizer = torch.optim.AdamW([
-        {"params": lora_params, "lr": float(optim["lr_lora"])},
-        {"params": network.head.parameters(), "lr": float(optim["lr_head"])},
+        {"params": lora_params, "lr": float(optim.get("lr_backbone", optim.get("lr_lora")))},
+        {"params": head_params, "lr": float(optim["lr_head"])},
     ], weight_decay=float(optim["weight_decay"]))
     # grad_accum_steps > 1 splits each optimizer step over that many loader batches (batch_size is per micro-batch)
     accum = optim.get("grad_accum_steps", 1)
@@ -132,7 +120,7 @@ def train(config, run_name, resume=None):
             if step % log["log_every"] == 0:
                 lrs = {"lr_head": scheduler.get_last_lr()[1]}
                 if lora_params:
-                    lrs["lr_lora"] = scheduler.get_last_lr()[0]
+                    lrs["lr_backbone"] = scheduler.get_last_lr()[0]
                 logger.log(step, split="train", epoch=epoch, loss=loss.item(), accuracy=correct / len(logits), **lrs)
             if step % log["save_every"] == 0:
                 logger.save_checkpoint(network, name="latest", step=step)
@@ -157,7 +145,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("config", help="YAML config, e.g. configs/smoke.yaml")
     parser.add_argument("--name", help="run name, used as runs/<name>-<timestamp> (default: config file name)")
-    parser.add_argument("--resume", help="start from a checkpoint's LoRA + head weights: an experiment id "
+    parser.add_argument("--resume", help="start from a checkpoint's trainable weights: an experiment id "
                                          "(uses its final checkpoint) or a checkpoint folder. Optimizer and LR schedule start fresh.")
     args = parser.parse_args()
 

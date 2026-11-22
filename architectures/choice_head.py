@@ -1,9 +1,20 @@
+"""Decision heads: turn one embedding per choice into one logit per choice.
+
+Both heads start with self-attention between the choices (no position embeddings, so the result
+does not depend on the order of the choices). They differ in how a choice becomes a score:
+
+bilinear_answer  (BEV, the original)  [task token, choice_1 ... choice_C, answer] -> self-attention
+                 -> logit_i = <proj(answer), proj(choice_i)>. Needs an "answer" embedding.
+candidate_mlp    (ours)               [choice_1 ... choice_C] -> self-attention
+                 -> logit_i = MLP(choice_i), the same MLP for every choice. No answer embedding.
+
+Pick one with head.type in the config. Both heads have the same call signature:
+    head(choice_embeddings [B, C, H], choice_mask [B, C], task_type [B], answer_embedding [B, H] or None)
+"""
 import math
 
 import torch
 import torch.nn as nn
-from peft import LoraConfig, get_peft_model
-from transformers import Qwen3Model
 
 
 class SelfAttention(nn.Module):
@@ -50,8 +61,8 @@ class AttentionBlock(nn.Module):
         return x
 
 
-class ChoiceHead(nn.Module):
-    """Runs self-attention over [task token, choice embeddings..., answer embedding] and scores each choice."""
+class BilinearAnswerHead(nn.Module):
+    """BEV head: self-attention over [task token, choice embeddings..., answer embedding], then a bilinear score."""
 
     def __init__(self, hidden_dim, new_dim, num_layers, num_task_types):
         super().__init__()
@@ -63,7 +74,7 @@ class ChoiceHead(nn.Module):
         self.answer_proj = nn.Linear(hidden_dim, new_dim)
         self.choice_proj = nn.Linear(hidden_dim, new_dim)
 
-    def forward(self, choice_embeddings, answer_embedding, choice_mask, task_type):
+    def forward(self, choice_embeddings, choice_mask, task_type, answer_embedding):
         # choice_embeddings: [B, C, H], answer_embedding: [B, H], choice_mask: [B, C], task_type: [B]
         B = choice_embeddings.shape[0]
         task_token = self.task_embedding(task_type).unsqueeze(1)
@@ -84,53 +95,41 @@ class ChoiceHead(nn.Module):
         return logits.masked_fill(~choice_mask, -float("inf"))
 
 
-class BEVNetwork(nn.Module):
-    def __init__(self, backbone, head):
+class CandidateMLPHead(nn.Module):
+    """Our head: self-attention between the candidates only, then the same MLP scores each candidate.
+
+        h_1 ... h_C  --self-attention x num_layers-->  h'_1 ... h'_C  --MLP (shared)-->  z_1 ... z_C
+
+    num_layers=0 skips the interaction: each candidate is scored on its own (a useful ablation).
+    task_type is not used: the task hint is already in the text every candidate was encoded with.
+    """
+
+    def __init__(self, hidden_dim, new_dim, num_layers, num_task_types=None):
         super().__init__()
-        self.backbone = backbone
-        self.head = head
-
-    def forward(self, input_ids, position_ids, attention_mask, choice_read_idx, choice_mask, answer_end_idx, task_type, **kwargs):
-        output = self.backbone(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=None,
-            inputs_embeds=None,
-            use_cache=False
+        self.input_norm = nn.LayerNorm(hidden_dim)
+        self.layers = nn.ModuleList([AttentionBlock(hidden_dim, new_dim) for _ in range(num_layers)])
+        self.final_norm = nn.LayerNorm(hidden_dim)
+        self.scorer = nn.Sequential(
+            nn.Linear(hidden_dim, new_dim),
+            nn.GELU(),
+            nn.Linear(new_dim, 1),
         )
-        hidden = output.last_hidden_state.float()
-        batch_idx = torch.arange(hidden.shape[0], device=hidden.device)
 
-        choice_embeddings = hidden[batch_idx[:, None], choice_read_idx]   # [B, C, H]
-        answer_embedding = hidden[batch_idx, answer_end_idx]              # [B, H]
-        # Head runs in fp32 even under bf16 autocast: bf16 logits are too coarse for a stable loss
-        with torch.autocast(device_type=hidden.device.type, enabled=False):
-            return self.head(choice_embeddings, answer_embedding, choice_mask, task_type)
-
-
-def load_backbone(model_name, num_layers=None):
-    # Only the first num_layers decoder layers are built and loaded; the rest are never executed
-    overrides = {} if num_layers is None else {"num_hidden_layers": num_layers}
-    return Qwen3Model.from_pretrained(model_name, dtype=torch.float32, **overrides)
+    def forward(self, choice_embeddings, choice_mask, task_type=None, answer_embedding=None):
+        x = self.input_norm(choice_embeddings)        # [B, C, H]
+        for layer in self.layers:
+            x = layer(x, choice_mask)                 # candidates attend to each other, never to padding
+        x = self.final_norm(x)
+        logits = self.scorer(x).squeeze(-1)           # [B, C]
+        return logits.masked_fill(~choice_mask, -float("inf"))
 
 
-def lora_target_regex(num_layers, last_k_layers):
-    layer_ids = "|".join(str(i) for i in range(num_layers - last_k_layers, num_layers))
-    return rf".*layers\.({layer_ids})\.self_attn\.(q_proj|k_proj|v_proj|o_proj)"
+HEADS = {"bilinear_answer": BilinearAnswerHead, "candidate_mlp": CandidateMLPHead}
 
 
-def build_network(model_name, num_layers, lora_r, lora_alpha, lora_dropout, lora_last_k_layers, head_config):
-    backbone = load_backbone(model_name, num_layers)
-    if lora_last_k_layers == 0:  # frozen Qwen, only the head trains
-        backbone.requires_grad_(False)
-    else:
-        lora_config = LoraConfig(
-            r=lora_r,
-            lora_alpha=lora_alpha,
-            lora_dropout=lora_dropout,
-            target_modules=lora_target_regex(backbone.config.num_hidden_layers, lora_last_k_layers),
-        )
-        backbone = get_peft_model(backbone, lora_config)
-    head = ChoiceHead(hidden_dim=backbone.config.hidden_size, **head_config)
-    return BEVNetwork(backbone, head)
+def build_head(head_config, hidden_dim, num_task_types, default_type):
+    head_config = dict(head_config)
+    head_type = head_config.pop("type", default_type)
+    if head_type not in HEADS:
+        raise ValueError(f"head.type must be one of {list(HEADS)}, got {head_type!r}")
+    return HEADS[head_type](hidden_dim=hidden_dim, num_task_types=num_task_types, **head_config)

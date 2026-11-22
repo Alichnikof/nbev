@@ -1,7 +1,14 @@
+"""BEV encoding: the question and all choices go into ONE Qwen sequence.
+
+Choices share starting position ids and the attention mask hides them from each other,
+so each choice is read as if it were the only one after the question.
+"""
 import os
 
 import torch
 from transformers import AutoTokenizer
+
+from architectures.prompts import context_prefix
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")  # the tokenizer is shared with DataLoader worker processes
 
@@ -112,17 +119,8 @@ def truncate(text, max_tokens):
     return tokenizer.decode(tokens[:max_tokens])
 
 
-# Short natural-language task hint
-TASK_PROMPTS = {
-    "choice": "Choose the best option.",
-    "score": "Rate it on the given scale.",
-    "noul": "Answer yes or no.",
-}
-
-
 def build_question(state, instructions, task_type, max_state_tokens):
-    # Task hint and question come before the state, so every state token is read knowing what is asked
-    return f"{TASK_PROMPTS[task_type]}\nQuestion: {instructions}\n\n{truncate(state, max_state_tokens)}\n"
+    return f"{context_prefix(instructions, task_type)}{truncate(state, max_state_tokens)}\n"
 
 
 def encode_example(state, instructions, choices, task_type, max_state_tokens, max_choice_tokens):
@@ -144,3 +142,41 @@ def encode_example(state, instructions, choices, task_type, max_state_tokens, ma
         "choice_read_idx": choice_read_idx,
         "answer_end_idx": span["answer_end_idx"],
     }
+
+
+def collate_fn(batch):
+    B = len(batch)
+    L = max(len(ex["input_ids"]) for ex in batch)
+    C = max(len(ex["choice_read_idx"]) for ex in batch)
+
+    input_ids = torch.full((B, L), tokenizer.pad_token_id, dtype=torch.long)
+    position_ids = torch.zeros((B, L), dtype=torch.long)
+    # Padded query rows attend only to themselves, otherwise their softmax row is all -inf -> NaN
+    attention_mask = torch.eye(L).repeat(B, 1, 1)
+    choice_read_idx = torch.zeros((B, C), dtype=torch.long)
+    choice_mask = torch.zeros((B, C), dtype=torch.bool)
+    answer_end_idx = torch.zeros(B, dtype=torch.long)
+
+    for b, ex in enumerate(batch):
+        n, c = len(ex["input_ids"]), len(ex["choice_read_idx"])
+        input_ids[b, :n] = torch.tensor(ex["input_ids"])
+        position_ids[b, :n] = torch.tensor(ex["position_ids"])
+        attention_mask[b, :n, :n] = ex["attention_mask"]
+        choice_read_idx[b, :c] = torch.tensor(ex["choice_read_idx"])
+        choice_mask[b, :c] = True
+        answer_end_idx[b] = ex["answer_end_idx"]
+
+    attention_mask = torch.where(attention_mask == 0, -float("inf"), 0.0).unsqueeze(1)  # B, 1, L, L
+
+    out = {
+        "input_ids": input_ids,
+        "position_ids": position_ids,
+        "attention_mask": attention_mask,
+        "choice_read_idx": choice_read_idx,
+        "choice_mask": choice_mask,
+        "answer_end_idx": answer_end_idx,
+        "task_type": torch.tensor([ex["task_type"] for ex in batch], dtype=torch.long),
+    }
+    if all(ex["label"] is not None for ex in batch):
+        out["labels"] = torch.tensor([ex["label"] for ex in batch], dtype=torch.long)
+    return out

@@ -1,0 +1,43 @@
+# Comparison run (Mac-sized), see qwen_bev.yaml. DeBERTa cross-encoder, fully fine-tuned, our candidate_mlp head.
+seed: 0
+
+model:
+  architecture: deberta_cross   # one [CLS] context [SEP] candidate [SEP] sequence per candidate
+  name: microsoft/deberta-v3-base
+  num_layers: null
+  pooling: cls                  # cls | choice_mean  <- the only difference with deberta_mean.yaml
+  full_finetune: true
+
+data:
+  max_train_questions: 10000
+  max_test_questions: 1000
+  eval_split: validation
+  max_state_tokens: 448
+  max_choice_tokens: 64
+  batch_size: 4                 # questions per micro-batch (~18 sequences)
+  num_workers: 2
+
+lora:
+  last_k_layers: 0              # unused with full_finetune
+  r: 8
+  alpha: 16
+  dropout: 0.0
+
+head:
+  type: candidate_mlp           # ours: candidate self-attention + shared MLP
+  new_dim: 512
+  num_layers: 2
+
+optim:
+  epochs: 1
+  lr_backbone: 3.0e-5           # full fine-tuning
+  lr_head: 1.0e-3
+  weight_decay: 0.01
+  warmup_ratio: 0.1
+  grad_clip: 1.0
+  grad_accum_steps: 4           # 4 x 4 = 16 questions per optimizer step
+
+logging:
+  log_every: 25
+  eval_every: 125
+  save_every: 1000000

@@ -1,0 +1,43 @@
+# DeBERTa-v3-base cross-encoder, LoRA on all 12 layers + choice head, full train split. Meant for a GPU.
+seed: 0
+
+model:
+  architecture: deberta_cross   # see architectures/__init__.py
+  name: microsoft/deberta-v3-base
+  num_layers: null              # all 12 layers
+  pooling: choice_mean          # cls | choice_mean
+  full_finetune: false
+
+data:
+  max_train_questions: null
+  max_test_questions: 5000
+  max_state_tokens: 448         # DeBERTa-v3 was pretrained on 512-token sequences
+  max_choice_tokens: 64
+  batch_size: 16                # questions per batch; each becomes one sequence per choice
+  num_workers: 6
+  eval_split: validation      # train | validation | test
+
+lora:
+  last_k_layers: 12
+  r: 8
+  alpha: 16
+  dropout: 0.0
+
+head:
+  type: candidate_mlp        # ours: candidate self-attention + shared MLP (bilinear_answer = BEV head)
+  new_dim: 512
+  num_layers: 2
+
+optim:
+  epochs: 1
+  lr_backbone: 2.0e-4
+  lr_head: 1.0e-3
+  weight_decay: 0.01
+  warmup_ratio: 0.05
+  grad_clip: 1.0
+  grad_accum_steps: 4         # 16 x 4 = 64 questions per optimizer step, like full_lora_k12
+
+logging:
+  log_every: 20
+  eval_every: 1000
+  save_every: 500
