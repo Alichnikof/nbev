@@ -1,129 +1,188 @@
-# Training JEV networks from Qwen
+# nbev: order-invariant multiple-choice decisions with a bidirectional encoder
 
-Train a network that answers choice, yes/no (`noul`), and score questions using a Qwen backbone and a small attention head. Choices share the same starting position IDs, and the attention mask prevents each choice from seeing the others. The head scores the choices without depending on their order.
+nbev ("new BEV") picks the best answer to a question about a conversation: route a support ticket to the right team, say yes or no, give a 1–5 score. It reads the question, the conversation and **every candidate answer in one DeBERTa-v3 pass**. It returns one **calibrated** probability per candidate, and the result does not depend on the order in which the candidates are listed.
 
-[Watch the video: Training JEV networks from Qwen](https://youtu.be/sF3CNPbWA8o)
+It started from [BEV](https://github.com/avbiswas/bev-train) by Avishek Biswas, which does this with a Qwen3 decoder. nbev takes BEV's order-invariance trick to an encoder-only model, adds a calibration and evaluation pipeline, and keeps the original Qwen model as a benchmark. See [What comes from BEV, what is new](#what-comes-from-bev-what-is-new).
 
-If you find this helpful, consider supporting on Patreon — it hosts all code, projects, slides, and write-ups from the YouTube channel.
+![nbev packed sequence and attention mask](assets/nbev_packing.png)
 
-[<img src="https://c5.patreon.com/external/logo/become_a_patron_button.png" alt="Become a Patron!" width="200">](https://www.patreon.com/NeuralBreakdownwithAVB)
+## The task
 
-## Start here: `arch.ipynb`
+The dataset is [avbiswas/bev-decision-150K](https://huggingface.co/datasets/avbiswas/bev-decision-150K). Every example is a *state* (a conversation or document ending with a `Response:` to judge), an instruction, and a set of candidate answers. There are three kinds of question:
 
-Open [`arch.ipynb`](arch.ipynb) for the architecture walkthrough from the livestream: tokenize the question and choices separately, build their position IDs, and construct the attention mask. The notebook explains the architecture; the Python files implement training and inference.
+| Task | Example | What we use |
+|---|---|---|
+| `choice` | "Which team should handle this ticket?" → Billing / Tech support / Sales | the probability of each option |
+| `noul` | "Does the response answer the question?" → Yes / No | P(yes) |
+| `score` | "Rate the response from 1 to 5" | the expected score Σ i·pᵢ |
 
-- [`architectures/`](architectures/): the two networks being compared (see below).
-- [`dataset.py`](dataset.py): load the dataset and expand rows into typed questions. Splits: `train`, `validation` (checkpoint selection), `calibration` (temperature fitting) and `test`. They are split by state text, so no state appears in two splits.
-- [`train.py`](train.py): training, gradient accumulation, validation, and checkpoint initialization.
-- [`logger.py`](logger.py): run metrics and checkpoints (trainable weights only).
-- [`inference.py`](inference.py): evaluation and typed answers through `answer()`.
-- [`metrics.py`](metrics.py): per-task metrics: accuracy, NLL, P(yes) Brier score and AUC, expected-score MAE, ECE.
-- [`calibration.py`](calibration.py): post-training temperature scaling, one temperature per task type.
-- [`deberta_full_walkthrough.ipynb`](deberta_full_walkthrough.ipynb): our DeBERTa model end to end, from data to training, calibration, test and hands-on questions. It uses [`configs/deberta_walkthrough.yaml`](configs/deberta_walkthrough.yaml) and reuses a finished run instead of retraining.
-- [`notebook_utils.py`](notebook_utils.py): the notebook's helpers (train or reuse a run, cached evaluation, plots, `ask`).
+All three use the same model, so the candidates can be any text of any length and in any number. They aren't single tokens or fixed classes.
 
-## Architectures
+## Results
 
-Pick an encoder with `model.architecture` and a decision head with `head.type`. Everything else is shared: data, prompt text, training loop, and metrics.
+These numbers come from a 20-minute run on a MacBook (M5 Pro, MPS): 10,000 training questions, one epoch, DeBERTa-v3-base fully fine-tuned. The test questions were never seen in training, checkpoint selection or calibration.
 
-| | `qwen_bev` (original) | `deberta_cross` | `nbev` |
+| Test (1,000 questions) | nbev | Majority / chance baseline |
+|---|---|---|
+| `choice` accuracy | **0.577** | 0.33 |
+| `score` accuracy (MAE of the expected score) | **0.468** (0.85) | 0.255 |
+| `noul` accuracy / AUC | 0.702 / **0.767** | 0.666 ("always No") / 0.5 |
+| Calibration error (ECE) choice / noul / score | **0.034 / 0.063 / 0.051** | |
+
+![training curves](assets/nbev_training.png)
+
+- **Order invariance holds:** shuffling the candidates changes their probabilities by at most 7·10⁻⁵, which is bf16 rounding.
+- **Speed:** nbev trains about 3× faster than a DeBERTa cross-encoder (1.6–2.2 s against 6.2 s per step of 16 questions). The context is encoded once per question, not once per candidate.
+- **Calibration:** after temperature scaling, a predicted 70% comes true about 70% of the time. The fitted temperatures are 1.36 (choice), 1.23 (noul) and 0.90 (score).
+- **Yes/no is the weak spot:** accuracy is only 3.6 points above always answering "No". The AUC of 0.77 shows the model ranks yes/no cases well, so this run is short of training rather than broken.
+
+This is a small-budget run. A controlled comparison of the three architectures on identical data is set up in [`configs/compare/`](configs/compare/); see [Benchmarking](#benchmarking-against-bev).
+
+## How nbev works
+
+### 1. One packed sequence per question
+
+```
+[CLS] task hint + question + state [SEP]  [OPT] Billing [SEP]  [OPT] Tech support [SEP]  [OPT] Sales [SEP]
+positions:  0 ...................... n-1    n    n+1 n+2         n    n+1  n+2    n+3      n    n+1  n+2
+```
+
+A cross-encoder builds one sequence per candidate (`[CLS] context [SEP] candidate [SEP]`), so a 4-candidate question re-encodes the same 448-token context 4 times. nbev puts the context once, followed by every candidate block. Code: [`architectures/nbev/tokenization.py`](architectures/nbev/tokenization.py).
+
+### 2. Shared positions: order invariance
+
+Every candidate block restarts at the same position `n`, so no candidate is "first" or "last". The rest of the encoder is symmetric: a bidirectional encoder with no positional difference between the blocks treats them as a set. Swapping two candidates swaps their output vectors and changes nothing else. A causal decoder like BEV's Qwen also needs the mask below for invariance, because a later token always sees the earlier ones. A bidirectional encoder gets invariance from the positions alone.
+
+### 3. The attention mask: candidates never see each other
+
+Positions alone aren't enough, for a different reason. Without a mask, tokens of different candidates sit at the same positions, and attention can't tell which candidate a token belongs to:
+
+> "not good" + "very bad" would be the same input as "very good" + "not bad", and every `[OPT]` token would get the same vector.
+
+I measured both effects before adding the mask. So the mask (figure above) allows:
+
+| Query → key | Allowed? |
+|---|---|
+| context → context | yes: the context is encoded once, independently of the candidates |
+| candidate → context | yes |
+| candidate → its own tokens | yes |
+| candidate → another candidate | **no** |
+
+Each candidate is read as if it were the only one after the question. Comparing candidates is left to the decision head, which can do it without breaking invariance.
+
+### 4. `[OPT]`: one vector per candidate, whatever its length
+
+Each block starts with an `[OPT]` marker (DeBERTa's `[MASK]` token reused, so the vocabulary is unchanged). It attends to all of its candidate's tokens, and its output vector represents the candidate, like the `[ENT]` token in GLiNER. "Tech support" (2 tokens) and "Sales" (1 token) each get one vector without averaging or truncation. `model.pooling` can switch to `mean` (mean of the candidate's tokens) or `opt_mean` (both) for ablations.
+
+### 5. Shared positions in DeBERTa-v3: a relative-position patch
+
+DeBERTa-v3 has **no absolute position embeddings**. Attention only sees the distance between two tokens, through log-bucketed relative positions. So shared positions are passed as a per-question relative-position matrix `rel[b, q, k] = pos[b, q] − pos[b, k]`. The stock Hugging Face code accepts only one such matrix for the whole batch. [`architectures/nbev/network.py`](architectures/nbev/network.py) patches each attention layer to compute its position bias question by question with the library's own function. A test checks that the patched model reproduces stock DeBERTa exactly on an ordinary sequence.
+
+### 6. Decision head
+
+The `candidate_mlp` head in [`architectures/choice_head.py`](architectures/choice_head.py) takes the candidate vectors and runs self-attention between them **with no positional encoding**, so the candidates can be compared and invariance is kept. The same MLP then turns each candidate into a logit. A softmax over the candidates gives the probabilities. The head runs in fp32 even under bf16 autocast.
+
+### 7. Long states keep their end
+
+States end with the `Response:` being judged. Cutting them at 448 tokens hid the very thing to evaluate in 9% of the examples. Long states now keep their first 64 tokens plus their end, joined by `...` ([`architectures/prompts.py`](architectures/prompts.py)). This applies to all architectures.
+
+## Calibration and evaluation
+
+The probabilities are meant to be used directly: P(yes), or the expected score. Accuracy and AUC can't check them, because they only look at the ranking, so the pipeline treats calibration as a goal of its own:
+
+- **Leak-free splits** ([`dataset.py`](dataset.py)): `validation` (checkpoint selection) and `calibration` (temperature fitting) are held out of the training data by **hashing the state text**, so duplicates of a state never land in two splits. `test` is the dataset's own test split.
+- **Checkpoint selection by validation NLL** (`logging.select_by: loss`), not accuracy, because the probabilities are what we use.
+- **Temperature scaling** ([`calibration.py`](calibration.py)): one temperature per task type, fitted on the calibration split. It's saved next to the checkpoint and applied automatically by `load_checkpoint`, `inference.py` and `answer()`. Accuracy is unchanged.
+- **Metrics per task** ([`metrics.py`](metrics.py)): accuracy and NLL for everything; AUC, Brier score and ECE for P(yes); MAE of the expected score; ECE for the top choice.
+
+## Tests
+
+```bash
+uv run python -m tests.test_nbev
+```
+
+[`tests/test_nbev.py`](tests/test_nbev.py) checks five things:
+- shuffling the candidates permutes the logits and changes nothing else;
+- no candidate can see another;
+- batching and padding don't change the results;
+- the relative-position patch reproduces stock DeBERTa;
+- long states keep their end, in all three architectures.
+
+## Quick start
+
+```bash
+uv sync                                                         # install locked dependencies
+uv run python train.py configs/compare/nbev.yaml --name nbev    # ~20-30 min on an M5 Pro
+uv run python calibration.py runs/nbev-<timestamp>/checkpoints/best --max_questions 1000
+uv run python inference.py runs/nbev-<timestamp>/checkpoints/best --split test --max_questions 1000
+```
+
+The code picks CUDA, then Apple MPS, then CPU. The first run downloads the model and the dataset.
+
+**Walkthrough notebook:** [`deberta_full_walkthrough.ipynb`](deberta_full_walkthrough.ipynb) runs everything end to end:
+- data and the packed encoding;
+- the attention mask;
+- training curves and calibration (metrics before and after temperature scaling);
+- test metrics and the order-invariance check;
+- questions of your own through `ask(...)`.
+
+It uses [`configs/deberta_walkthrough.yaml`](configs/deberta_walkthrough.yaml) and reuses a finished run instead of retraining.
+
+Other entry points:
+- `--resume runs/<id>/checkpoints/final` starts from saved weights;
+- `full_finetune: true` trains every weight, while `lora.last_k_layers: k` freezes the backbone and adds LoRA to its last k layers;
+- `data.group_by_length: true` batches questions of similar length;
+- `optim.grad_accum_steps` sets gradient accumulation.
+
+## Benchmarking against BEV
+
+`model.architecture` selects the encoder. Data, prompts, training loop, calibration and metrics are shared, so the comparison is like for like:
+
+| | `qwen_bev` (original BEV) | `deberta_cross` | `nbev` (this project) |
 |---|---|---|---|
-| Backbone | Qwen3 decoder (causal) | DeBERTa-v3 encoder (bidirectional) | DeBERTa-v3 encoder (bidirectional) |
-| Sequences per question | 1: `question+state <option>A</option><option>B</option>… The answer is:` | 1 per choice: `[CLS] question+state [SEP] choice [SEP]` | 1: `[CLS] question+state [SEP] [OPT] A [SEP] [OPT] B [SEP] …` |
-| Choice order | invariant: choices share positions and are masked apart | invariant: one sequence per choice | invariant: choices share positions and are masked apart, as in BEV |
-| Choice embedding | last token of each choice | `model.pooling`: `cls` or `choice_mean` | `model.pooling`: `opt` (the `[OPT]` token), `mean` or `opt_mean` |
-| Default head | `bilinear_answer` | `candidate_mlp` | `candidate_mlp` |
-| Cost | context encoded once | context encoded once per choice | context encoded once (~3x faster than `deberta_cross`) |
-| Code | [`architectures/qwen_bev/`](architectures/qwen_bev/) | [`architectures/deberta_cross/`](architectures/deberta_cross/) | [`architectures/nbev/`](architectures/nbev/) |
+| Backbone | Qwen3-0.6B decoder (causal), LoRA | DeBERTa-v3 encoder, full fine-tune | DeBERTa-v3 encoder, full fine-tune |
+| Sequences per question | 1 | 1 per candidate | 1 |
+| Order invariance | shared positions + mask | separate sequences | shared positions (+ mask to keep candidates apart) |
+| Candidate vector | last token of the candidate | `[CLS]` or mean of candidate tokens | `[OPT]` token (or mean / both) |
+| Context encoded | once | once per candidate | once |
+| Code | [`qwen_bev/`](architectures/qwen_bev/) | [`deberta_cross/`](architectures/deberta_cross/) | [`nbev/`](architectures/nbev/) |
 
-`nbev` ("new BEV") is BEV's packing on a bidirectional encoder. Every choice restarts at the same position, which on its own makes a bidirectional encoder order-invariant. The attention mask lets a choice see only the context and itself, so each choice is read as if it were the only one. Without the mask, tokens of different choices would share positions and the encoder could not tell which choice a token belongs to: "not good" + "very bad" would be the same input as "very good" + "not bad". Its `[OPT]` token (DeBERTa's `[MASK]` token, reused) attends to all of the choice's tokens, so its output represents the whole choice however many tokens it has. DeBERTa-v3 only uses relative positions, so the shared positions are passed as a per-question relative-position matrix; [`network.py`](architectures/nbev/network.py) patches the attention layers to accept one matrix per question. `uv run python -m tests.test_nbev` checks order invariance, choice isolation, padding, and that the patch reproduces stock DeBERTa.
-
-Long states keep their first 64 tokens and their end; the middle is dropped (all architectures). States end with the `Response:` being judged, so cutting the end would hide it from the model.
-
-Decision heads ([`choice_head.py`](architectures/choice_head.py)) work with any encoder. In both, the candidates first attend to each other with no positional encoding, so the result doesn't depend on candidate order:
-
-- `bilinear_answer` (BEV): self-attention over `[task token, candidates…, answer]`, then each candidate is scored by a bilinear product with the answer slot. With `deberta_cross`, which has no answer token, the answer slot is a learned vector (`answer_query`).
-- `candidate_mlp` (ours): self-attention over the candidates only, then the same MLP turns each candidate into a logit. `head.num_layers: 0` scores each candidate independently.
-
-Each package has a `tokenization.py` (`encode_example`, `collate_fn`) and a `network.py` (`build_network`). Backbone training is set per config: `lora.last_k_layers: 0` freezes it, `k > 0` adds LoRA to the last k layers, and `model.full_finetune: true` trains every weight.
-
-### Comparing them
-
-[`configs/compare/`](configs/compare/) holds Mac-sized runs on identical data: 10K training questions, 448 state tokens, 16 questions per optimizer step. Qwen trains with LoRA as in BEV; DeBERTa is fully fine-tuned, as a cross-encoder (`cls` or `choice_mean` pooling) or packed (`nbev.yaml`). They batch questions of similar length together (`data.group_by_length`) and keep the checkpoint with the lowest validation NLL (`logging.select_by: loss`; the default is `accuracy`). Each takes up to about an hour on an M5 Pro:
+[`configs/compare/`](configs/compare/) runs all of them on the same 10K questions with the same truncation, batch size, and checkpoint rule:
 
 ```bash
-uv run python train.py configs/compare/deberta_mean.yaml --name cmp-deberta-mean
-uv run python calibration.py runs/cmp-deberta-mean-<timestamp>/checkpoints/best
+for c in nbev deberta_mean deberta_cls qwen_bev; do
+  uv run python train.py configs/compare/$c.yaml --name cmp-$c
+done
 ```
 
-Full-scale DeBERTa configs for a GPU: [`deberta_lora.yaml`](configs/deberta_lora.yaml) and [`deberta_full_ft.yaml`](configs/deberta_full_ft.yaml). Sanity check: [`deberta_smoke.yaml`](configs/deberta_smoke.yaml).
+## What comes from BEV, what is new
 
-Dataset: [avbiswas/bev-decision-150K](https://huggingface.co/datasets/avbiswas/bev-decision-150K). Training loads this dataset automatically.
+| From [BEV](https://github.com/avbiswas/bev-train) (Avishek Biswas) | New in nbev |
+|---|---|
+| The idea of packing all candidates into one sequence with shared positions and a mask | Moving it to a **bidirectional encoder**, and the analysis of why positions give invariance but the mask is still needed |
+| The Qwen3 decoder model (`qwen_bev`), kept as the benchmark | The `nbev` encoder: `[OPT]` token pooling and the DeBERTa-v3 **relative-position patch** |
+| The dataset, task types and prompt format | The `deberta_cross` cross-encoder baseline and the shared `architectures/` package |
+| The `bilinear_answer` decision head and the training loop | The `candidate_mlp` head |
+| Data loading, logging, inference | **Calibration**: leak-free validation/calibration splits, per-task temperature scaling, ECE/Brier/AUC metrics, selection by NLL |
+| | Head+tail truncation, length-grouped batching, the invariance and isolation tests, and the walkthrough notebook |
 
-Original livestream: [Architecture walkthrough](https://youtube.com/live/AzxoU7kxjig).
+The original livestream walkthrough of BEV is in [`arch.ipynb`](arch.ipynb) ([video](https://youtube.com/live/AzxoU7kxjig)).
 
-## Setup
+## Repository layout
 
-Install [uv](https://docs.astral.sh/uv/), then install the locked dependencies:
-
-```bash
-uv sync
 ```
-
-The first run downloads the Qwen3-0.6B weights, tokenizer, and dataset. The code selects CUDA, then Apple MPS, then CPU. Full training configs are intended for a GPU; reduce the batch size for smaller devices.
-
-For a fresh Ubuntu GPU machine, [`cloud_startup_script.sh`](cloud_startup_script.sh) installs the system tools, sets up uv, and checks CUDA availability:
-
-```bash
-bash cloud_startup_script.sh
-```
-
-## Train
-
-For a small overfitting sanity check, use the 10-question config:
-
-```bash
-uv run python train.py configs/smoke.yaml --name smoke
-```
-
-This config runs 30 epochs to check whether the model can learn those questions. For full training with the first 20 Qwen layers and LoRA on the last 12 kept layers (8–19):
-
-```bash
-uv run python train.py configs/full_lora_k12.yaml --name full-lora-k12
-```
-
-That config trains the choice head and LoRA adapters, uses 1,024 state tokens, and accumulates two microbatches of 32 questions per optimizer step. `optim.grad_accum_steps` defaults to 1. Logging, validation, and saving intervals count optimizer steps. An incomplete final accumulation group is skipped.
-
-Other configs include [`full_head_only.yaml`](configs/full_head_only.yaml) for a frozen backbone and [`full_lora.yaml`](configs/full_lora.yaml) for LoRA on the last four of 20 kept layers.
-
-Each run writes its config, metrics, summary, and checkpoints under `runs/<name>-<timestamp>/`. A checkpoint holds `weights.safetensors` (every trainable tensor: head, LoRA or fine-tuned weights) and its `config.yaml`; frozen pretrained weights are loaded from the Hugging Face Hub. `best` tracks test accuracy, `latest` is overwritten at each save interval, and `final` is saved at the end.
-
-## Start from saved weights
-
-Pass a checkpoint directory or a run ID (which selects that run's final checkpoint):
-
-```bash
-uv run python train.py configs/full_lora_k12.yaml --name continued \
-  --resume runs/<run-id>/checkpoints/final
-```
-
-Use the same architecture, backbone, head, and LoRA configuration as the checkpoint. `--resume` initializes a new training run from the saved weights: the optimizer, learning-rate schedule, and step counter start fresh.
-
-## Evaluate
-
-```bash
-uv run python inference.py runs/<run-id>/checkpoints/final \
-  --max_questions 100 --batch_size 2 --num_workers 0
-```
-
-Evaluation reports loss, overall accuracy, accuracy per task type, yes/no AUC when both label classes are present, and expected calibration error (ECE). It uses the checkpoint's architecture and token limits. `--split` is `train`, `validation`, or `test`.
-
-## Calibrate
-
-The model's probabilities are used directly: P(yes) for yes/no questions and the expected score for score questions. These numbers are only meaningful if the model is calibrated. Accuracy and AUC can't show calibration problems, because they only use the ranking of the probabilities.
-
-After training, fit one temperature per task type on the `calibration` split, which is used neither for training nor for checkpoint selection. Then `softmax(logits / T_task)` gives calibrated probabilities, and accuracy doesn't change. The temperatures are saved as `calibration.json` in the checkpoint, and `load_checkpoint`, `inference.py` and `answer()` use them automatically from then on:
-
-```bash
-uv run python calibration.py runs/<run-id>/checkpoints/best --max_questions 2000
+architectures/
+  nbev/            packed DeBERTa encoder (this project): tokenization.py, network.py
+  deberta_cross/   DeBERTa cross-encoder baseline
+  qwen_bev/        original BEV (Qwen3 decoder)
+  choice_head.py   decision heads (candidate_mlp, bilinear_answer)
+  prompts.py       prompt text and head+tail truncation
+dataset.py         loading, leak-free splits, length-grouped batching
+train.py           training loop, gradient accumulation, checkpoint selection
+calibration.py     per-task temperature scaling
+metrics.py         per-task metrics (NLL, AUC, Brier, ECE, MAE)
+inference.py       evaluation and answer()
+configs/           training configs (compare/ = like-for-like benchmark)
+tests/             invariance, isolation and patch tests
+scripts/           README figures
 ```

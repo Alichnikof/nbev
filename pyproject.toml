@@ -1,7 +1,7 @@
 [project]
-name = "bev-train"
+name = "nbev"
 version = "0.1.0"
-description = "Add your description here"
+description = "Order-invariant multiple-choice decisions with a bidirectional encoder (DeBERTa-v3), calibrated per task"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
