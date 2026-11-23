@@ -87,7 +87,7 @@ def main():
     device = get_device()
     network, config = load_checkpoint(args.checkpoint, device)
     arch, data = get_architecture(config), config["data"]
-    questions = load_questions(args.split, args.max_questions)
+    questions = load_questions(args.split, args.max_questions, task_types=data.get("task_types"))
     # Same encoding and truncation as during training, read from the checkpoint's config
     dataset = QuestionDataset(questions, arch.encode_example, data["max_state_tokens"], data["max_choice_tokens"])
     loader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size, collate_fn=arch.collate_fn,

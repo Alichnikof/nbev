@@ -39,11 +39,12 @@ def question_to_choices(question):
 
 def explode_questions(rows):
     """One dataset row can hold many questions about the same state -> one output row per question."""
-    out = {"state": [], "task_type": [], "instructions": [], "choices": [], "label": []}
-    for state, questions_json in zip(rows["state"], rows["questions_json"]):
+    out = {"state": [], "task_type": [], "instructions": [], "choices": [], "label": [], "domain": []}
+    for state, questions_json, domain in zip(rows["state"], rows["questions_json"], rows["domain"]):
         for question in json.loads(questions_json).values():
             choices, label = question_to_choices(question)
             out["state"].append(state)
+            out["domain"].append(domain)
             out["task_type"].append(TASK_TYPES[question["type"]])
             out["instructions"].append(question["instructions"])
             out["choices"].append(choices)
@@ -51,8 +52,9 @@ def explode_questions(rows):
     return out
 
 
-def load_questions(split, max_questions=None, seed=0):
-    """split: one of SPLITS. validation and calibration are held out of the dataset's train split (see above)."""
+def load_questions(split, max_questions=None, seed=0, task_types=None):
+    """split: one of SPLITS. validation and calibration are held out of the dataset's train split (see above).
+    task_types: e.g. ["choice"] keeps only those question types (config data.task_types); None keeps all three."""
     if split not in SPLITS:
         raise ValueError(f"split must be one of {SPLITS}, got {split!r}")
     if split == "test":
@@ -61,11 +63,18 @@ def load_questions(split, max_questions=None, seed=0):
         heldout = range(0, 1000) if split == "train" else HELDOUT_PER_MILLE[split]
         keep = (lambda b: b >= 40) if split == "train" else (lambda b: b in heldout)
         ds = load_dataset(DATASET_NAME, split="train").filter(lambda row: keep(state_bucket(row["state"])))
+    if task_types is not None:
+        # Rows with at least one question of a kept type; the same state-hash splits, so still leak-free
+        ds = ds.filter(lambda row: any(t in task_types for t in row["question_types"]))
     ds = ds.shuffle(seed=seed)
     if max_questions is not None:
-        # Every row has at least one question, so this many rows is always enough
+        # Every (kept) row has at least one (kept) question, so this many rows is always enough
         ds = ds.select(range(min(max_questions, len(ds))))
-    ds = ds.map(explode_questions, batched=True, remove_columns=ds.column_names)
+    # Not cached on disk: exploding is cheap, and a stale cache would hide changes to explode_questions
+    ds = ds.map(explode_questions, batched=True, remove_columns=ds.column_names, load_from_cache_file=False)
+    if task_types is not None:
+        kept = {TASK_TYPES[t] for t in task_types}
+        ds = ds.filter(lambda row: row["task_type"] in kept, load_from_cache_file=False)
     if max_questions is not None:
         ds = ds.select(range(min(max_questions, len(ds))))
     return ds
@@ -82,6 +91,7 @@ class LengthGroupedBatchSampler(torch.utils.data.Sampler):
     def __init__(self, lengths, batch_size, seed=0, group_batches=50):
         self.lengths, self.batch_size, self.seed, self.group_batches = lengths, batch_size, seed, group_batches
         self.epoch = 0
+        self.skip = 0  # batches to skip at the start of the next epoch: continuing a run that stopped mid-epoch
 
     def __len__(self):
         return math.ceil(len(self.lengths) / self.batch_size)
@@ -95,7 +105,8 @@ class LengthGroupedBatchSampler(torch.utils.data.Sampler):
         for start in range(0, len(order), group_size):
             group = sorted(order[start:start + group_size], key=self.lengths.__getitem__)
             batches += [group[i:i + self.batch_size] for i in range(0, len(group), self.batch_size)]
-        for i in torch.randperm(len(batches), generator=generator).tolist():
+        skip, self.skip = self.skip, 0
+        for i in torch.randperm(len(batches), generator=generator).tolist()[skip:]:
             yield batches[i]
 
 

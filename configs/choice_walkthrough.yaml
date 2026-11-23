@@ -1,0 +1,56 @@
+# Used by choice_walkthrough.ipynb (also runnable on its own:
+#   uv run python train.py configs/choice_walkthrough.yaml --name nbev-choice)
+#
+# Same model and settings as deberta_walkthrough.yaml, trained and evaluated on `choice` questions only
+# (data.task_types). The splits are the same state-hash splits, filtered, so they stay leak-free.
+#
+# Our model: nbev ("new BEV") = DeBERTa with BEV-style packing + candidate_mlp head, FULLY fine-tuned
+# (every DeBERTa weight trains, no LoRA). One sequence per question: the choices share positions and are
+# masked from each other, so the context is encoded once and the result does not depend on choice order.
+# 10,000 training questions -> 625 optimizer steps -> about 25-30 minutes on an M5 Pro (GPU via MPS).
+# More questions = better model but proportionally longer: ~0.14 s per training question.
+seed: 0
+
+model:
+  architecture: nbev            # "[CLS] question+state [SEP] [OPT] A [SEP] [OPT] B [SEP] ..." per question
+  name: microsoft/deberta-v3-base
+  num_layers: null              # all 12 layers
+  pooling: opt                  # choice vector = output of its [OPT] token (alternatives: mean, opt_mean)
+  full_finetune: true
+
+data:
+  task_types: [choice]          # only multiple-choice questions (null or absent = all three types)
+  max_train_questions: 10000
+  max_test_questions: 500       # questions of the eval split used to pick the best checkpoint
+  eval_split: validation        # calibration and test splits stay untouched during training
+  max_state_tokens: 448         # long states keep their first 64 tokens and their end (the response being judged)
+  max_choice_tokens: 64
+  batch_size: 8                 # questions per micro-batch (one sequence each)
+  num_workers: 0
+  group_by_length: true         # batches of similar length: less padding
+
+lora:
+  last_k_layers: 0              # unused: full_finetune trains everything
+  r: 8
+  alpha: 16
+  dropout: 0.0
+
+head:
+  type: candidate_mlp           # ours: self-attention between candidates, then the same MLP scores each one
+  new_dim: 512
+  num_layers: 2
+
+optim:
+  epochs: 1
+  lr_backbone: 3.0e-5           # small: DeBERTa is pretrained
+  lr_head: 1.0e-3               # large: the head starts from random weights
+  weight_decay: 0.01
+  warmup_ratio: 0.1
+  grad_clip: 1.0
+  grad_accum_steps: 2           # 8 x 2 = 16 questions per optimizer step
+
+logging:
+  log_every: 10                 # optimizer steps (train lines average everything since the previous line)
+  eval_every: 100               # evaluate on validation, keep the best checkpoint
+  save_every: 1000000           # no intermediate "latest" checkpoint (each full checkpoint is ~750 MB)
+  select_by: loss               # best checkpoint = lowest validation NLL (we use the probabilities)

@@ -4,6 +4,8 @@ nbev ("new BEV") picks the best answer to a question about a conversation: route
 
 It started from [BEV](https://github.com/avbiswas/bev-train) by Avishek Biswas, which does this with a Qwen3 decoder. nbev takes BEV's order-invariance trick to an encoder-only model, adds a calibration and evaluation pipeline, and keeps the original Qwen model as a benchmark. See [What comes from BEV, what is new](#what-comes-from-bev-what-is-new).
 
+**Start here:** [`choice_walkthrough.ipynb`](choice_walkthrough.ipynb) walks through nbev trained on all ~98K multiple-choice questions: data, model, training, calibration, test results, example predictions, and questions of your own. See [Quick start](#quick-start).
+
 ![nbev packed sequence and attention mask](assets/nbev_packing.png)
 
 ## The task
@@ -18,25 +20,86 @@ The dataset is [avbiswas/bev-decision-150K](https://huggingface.co/datasets/avbi
 
 All three use the same model, so the candidates can be any text of any length and in any number. They aren't single tokens or fixed classes.
 
-## Results
+The results below are on `choice` questions. The code handles all three types, but so far only the choice model has been trained long enough to report.
 
-These numbers come from a 20-minute run on a MacBook (M5 Pro, MPS): 10,000 training questions, one epoch, DeBERTa-v3-base fully fine-tuned. The test questions were never seen in training, checkpoint selection or calibration.
+## Results: multiple choice
 
-| Test (1,000 questions) | nbev | Majority / chance baseline |
+nbev (DeBERTa-v3-base, fully fine-tuned) was trained on all 98,085 `choice` training questions for one epoch: 6,130 optimizer steps of 16 questions, 2.1 h on a MacBook (M5 Pro, MPS), with [`configs/choice_full.yaml`](configs/choice_full.yaml). The test questions were never seen in training, checkpoint selection or calibration.
+
+| Test (5,000 choice questions, 2 to 10 options) | nbev | Chance |
 |---|---|---|
-| `choice` accuracy | **0.577** | 0.33 |
-| `score` accuracy (MAE of the expected score) | **0.468** (0.85) | 0.255 |
-| `noul` accuracy / AUC | 0.702 / **0.767** | 0.666 ("always No") / 0.5 |
-| Calibration error (ECE) choice / noul / score | **0.034 / 0.063 / 0.051** | |
+| Accuracy | **0.708** (± 0.013 at 95%) | 0.26 |
+| NLL | 0.672 | |
+| Calibration error (ECE), before → after temperature scaling | 0.028 → **0.018** | |
 
-![training curves](assets/nbev_training.png)
+![training curves of the choice run](assets/choice_training.png)
 
-- **Order invariance holds:** shuffling the candidates changes their probabilities by at most 7·10⁻⁵, which is bf16 rounding.
-- **Speed:** nbev trains about 3× faster than a DeBERTa cross-encoder (1.6–2.2 s against 6.2 s per step of 16 questions). The context is encoded once per question, not once per candidate.
-- **Calibration:** after temperature scaling, a predicted 70% comes true about 70% of the time. The fitted temperatures are 1.36 (choice), 1.23 (noul) and 0.90 (score).
-- **Yes/no is the weak spot:** accuracy is only 3.6 points above always answering "No". The AUC of 0.77 shows the model ranks yes/no cases well, so this run is short of training rather than broken.
+- **Training:** validation NLL falls at almost every check, and accuracy levels off around 0.70 from step ~4,000 as the cosine schedule takes the learning rate to 0. The best checkpoint (lowest validation NLL) is the last one. A pilot on 10K choice questions ([`configs/choice_walkthrough.yaml`](configs/choice_walkthrough.yaml)) reached 0.62 on the same test questions, so 10× more data gave about +9 points.
+- **Calibration:** one temperature, T = 1.25, fitted on 1,943 calibration questions. T > 1 means the raw model was slightly over-confident. After scaling, an answer given with 70% confidence is right about 70% of the time. Accuracy is unchanged.
+- **Speed:** 28 ms per question end to end (tokenization, one forward pass, softmax), about 36 questions per second on MPS. The context is encoded once, so a question takes 12 ms with 2 options and 86 ms with 32.
+- **Order invariance** is exact up to floating-point rounding, and [`tests/test_nbev.py`](tests/test_nbev.py) checks it.
 
-This is a small-budget run. A controlled comparison of the three architectures on identical data is set up in [`configs/compare/`](configs/compare/); see [Benchmarking](#benchmarking-against-bev).
+<img src="assets/choice_calibration.png" alt="reliability diagram on the test split" width="420">
+
+### By domain
+
+The kind of question matters much more than the number of options:
+
+| Domain | Test questions | Accuracy | Chance |
+|---|---|---|---|
+| Spatial and logical reasoning | 1,592 | 0.54 | 0.23 |
+| Support and intent routing | 762 | 0.97 | 0.25 |
+| Retail, product, and shopping | 612 | 0.44 | 0.21 |
+| Tool and workflow decisions | 582 | 0.99 | 0.30 |
+| Software engineering and code | 537 | 0.69 | 0.25 |
+| Sentiment, emotion, and moderation | 295 | 0.85 | 0.25 |
+| Response preference and quality | 184 | 0.64 | 0.50 |
+| Scientific and paper understanding | 122 | 0.89 | 0.33 |
+| Contract evidence | 95 | 0.63 | 0.33 |
+| Browser interaction | 83 | 0.87 | 0.20 |
+
+Three smaller domains (under 70 questions each) are in the notebook.
+
+- **Nearly solved** when the answer is a match or a classification: tool choice, intent routing, paper understanding, browser actions, emotions. Most of the confident mistakes there are ambiguous labels, such as `datetime_query` vs `datetime_convert` for a time-zone question.
+- **Hard** when the answer must be computed from the state: spatial and logical puzzles (a third of the test) and retail invoices ("largest quantity × unit price", "cheapest per unit"). One forward pass of a 184M-parameter encoder handles arithmetic and multi-step spatial reasoning poorly; a larger backbone would most likely help there first.
+
+**Not reported yet.** Yes/no (`noul`) and score questions, the DeBERTa cross-encoder baseline and the original BEV model (`qwen_bev`) all run with this code, but none of them has been trained at a comparable scale yet, so their numbers are left out. See [Benchmarking against BEV](#benchmarking-against-bev).
+
+## Quick start
+
+```bash
+uv sync                                                                                  # install locked dependencies
+caffeinate -i uv run python train.py configs/choice_full.yaml --name nbev-choice-full   # ~2 h on an M5 Pro
+```
+
+Then open [`choice_walkthrough.ipynb`](choice_walkthrough.ipynb). It loads the latest `runs/nbev-choice-full-*` run (it never trains), fits the temperature on the calibration split, measures the test split once and saves `test_metrics.json` in the run folder. Model outputs are cached next to the checkpoint, so the first run takes ~10 min and later ones ~1 min.
+
+- `caffeinate -i` keeps a Mac awake while the run lasts; drop it on other systems. The code picks CUDA, then Apple MPS, then CPU. The first run downloads the model and the dataset.
+- A run that stops continues where it left off: `uv run python train.py configs/choice_full.yaml --continue_run runs/nbev-choice-full-<timestamp>`. `checkpoints/latest` (weights, optimizer, LR schedule, data position) is saved every 500 steps.
+- For a 25–30 min run on 10K questions, train [`configs/choice_walkthrough.yaml`](configs/choice_walkthrough.yaml) and set `CONFIG_PATH` and `RUN_NAME` in the notebook's first cell.
+
+The same steps without the notebook:
+
+```bash
+uv run python calibration.py runs/nbev-choice-full-<timestamp>/checkpoints/best
+uv run python inference.py runs/nbev-choice-full-<timestamp>/checkpoints/best --split test --max_questions 5000
+```
+
+### Notebooks
+
+| Notebook | What it covers |
+|---|---|
+| [`choice_walkthrough.ipynb`](choice_walkthrough.ipynb) (**entry point**) | The trained choice model: data and splits, the packed input, training curves, parameters layer by layer, calibration, test results by domain and by number of options, inference speed, predictions and the most confident mistakes, and `ask(...)` for your own questions |
+| [`deberta_full_walkthrough.ipynb`](deberta_full_walkthrough.ipynb) | The architecture step by step on all three question types: the packed encoding, what the model reads, the attention mask. Its training run ([`configs/deberta_walkthrough.yaml`](configs/deberta_walkthrough.yaml)) is a short demo, not a result |
+| [`arch.ipynb`](arch.ipynb) | The original BEV livestream walkthrough ([video](https://youtube.com/live/AzxoU7kxjig)) |
+
+### Training options
+
+- `data.task_types: [choice]` keeps one question type (null or absent keeps all three); the splits stay leak-free;
+- `--resume runs/<id>/checkpoints/final` starts from saved weights, with a fresh optimizer and schedule;
+- `full_finetune: true` trains every weight, while `lora.last_k_layers: k` freezes the backbone and adds LoRA to its last k layers;
+- `data.group_by_length: true` batches questions of similar length;
+- `optim.grad_accum_steps` sets gradient accumulation.
 
 ## How nbev works
 
@@ -108,32 +171,6 @@ uv run python -m tests.test_nbev
 - the relative-position patch reproduces stock DeBERTa;
 - long states keep their end, in all three architectures.
 
-## Quick start
-
-```bash
-uv sync                                                         # install locked dependencies
-uv run python train.py configs/compare/nbev.yaml --name nbev    # ~20-30 min on an M5 Pro
-uv run python calibration.py runs/nbev-<timestamp>/checkpoints/best --max_questions 1000
-uv run python inference.py runs/nbev-<timestamp>/checkpoints/best --split test --max_questions 1000
-```
-
-The code picks CUDA, then Apple MPS, then CPU. The first run downloads the model and the dataset.
-
-**Walkthrough notebook:** [`deberta_full_walkthrough.ipynb`](deberta_full_walkthrough.ipynb) runs everything end to end:
-- data and the packed encoding;
-- the attention mask;
-- training curves and calibration (metrics before and after temperature scaling);
-- test metrics and the order-invariance check;
-- questions of your own through `ask(...)`.
-
-It uses [`configs/deberta_walkthrough.yaml`](configs/deberta_walkthrough.yaml) and reuses a finished run instead of retraining.
-
-Other entry points:
-- `--resume runs/<id>/checkpoints/final` starts from saved weights;
-- `full_finetune: true` trains every weight, while `lora.last_k_layers: k` freezes the backbone and adds LoRA to its last k layers;
-- `data.group_by_length: true` batches questions of similar length;
-- `optim.grad_accum_steps` sets gradient accumulation.
-
 ## Benchmarking against BEV
 
 `model.architecture` selects the encoder. Data, prompts, training loop, calibration and metrics are shared, so the comparison is like for like:
@@ -147,7 +184,7 @@ Other entry points:
 | Context encoded | once | once per candidate | once |
 | Code | [`qwen_bev/`](architectures/qwen_bev/) | [`deberta_cross/`](architectures/deberta_cross/) | [`nbev/`](architectures/nbev/) |
 
-[`configs/compare/`](configs/compare/) runs all of them on the same 10K questions with the same truncation, batch size, and checkpoint rule:
+[`configs/compare/`](configs/compare/) runs all of them on the same 10K questions with the same truncation, batch size, and checkpoint rule. These runs are set up but haven't been trained at the scale of the choice model yet, so no comparison numbers are reported.
 
 ```bash
 for c in nbev deberta_mean deberta_cls qwen_bev; do
@@ -163,26 +200,27 @@ done
 | The Qwen3 decoder model (`qwen_bev`), kept as the benchmark | The `nbev` encoder: `[OPT]` token pooling and the DeBERTa-v3 **relative-position patch** |
 | The dataset, task types and prompt format | The `deberta_cross` cross-encoder baseline and the shared `architectures/` package |
 | The `bilinear_answer` decision head and the training loop | The `candidate_mlp` head |
-| Data loading, logging, inference | **Calibration**: leak-free validation/calibration splits, per-task temperature scaling, ECE/Brier/AUC metrics, selection by NLL |
-| | Head+tail truncation, length-grouped batching, the invariance and isolation tests, and the walkthrough notebook |
-
-The original livestream walkthrough of BEV is in [`arch.ipynb`](arch.ipynb) ([video](https://youtube.com/live/AzxoU7kxjig)).
+| Data loading, logging, inference | **Calibration**: leak-free validation/calibration splits, per-task temperature scaling, ECE/Brier/AUC metrics, selection by NLL. BEV picked its best checkpoint by accuracy on the test split, which inflates the test number; here test is never seen before the end |
+| | Head+tail truncation, length-grouped batching, single-task training (`data.task_types`), resumable runs (`--continue_run`), the invariance and isolation tests, and the walkthrough notebooks |
 
 ## Repository layout
 
 ```
+choice_walkthrough.ipynb         entry point: the trained multiple-choice model
+deberta_full_walkthrough.ipynb   the architecture step by step, all three task types
 architectures/
   nbev/            packed DeBERTa encoder (this project): tokenization.py, network.py
   deberta_cross/   DeBERTa cross-encoder baseline
   qwen_bev/        original BEV (Qwen3 decoder)
   choice_head.py   decision heads (candidate_mlp, bilinear_answer)
   prompts.py       prompt text and head+tail truncation
-dataset.py         loading, leak-free splits, length-grouped batching
-train.py           training loop, gradient accumulation, checkpoint selection
+dataset.py         loading, leak-free splits, task-type filter, length-grouped batching
+train.py           training loop, gradient accumulation, checkpoint selection, --continue_run
 calibration.py     per-task temperature scaling
 metrics.py         per-task metrics (NLL, AUC, Brier, ECE, MAE)
 inference.py       evaluation and answer()
-configs/           training configs (compare/ = like-for-like benchmark)
+notebook_utils.py  notebook helpers: plots, cached evaluation, predictions, ask()
+configs/           training configs (choice_full = the reported run, compare/ = like-for-like benchmark)
 tests/             invariance, isolation and patch tests
 scripts/           README figures
 ```

@@ -1,4 +1,5 @@
 import json
+import shutil
 import time
 from datetime import datetime
 from pathlib import Path
@@ -15,12 +16,17 @@ from dataset import TASK_TYPES
 class RunLogger:
     """Each training run gets runs/<name>-<timestamp>/ with config, metrics and checkpoints (trainable weights only)."""
 
-    def __init__(self, config, run_name, device, root="runs"):
+    def __init__(self, config, run_name, device, root="runs", run_dir=None, elapsed=0.0):
+        """run_dir: continue logging into an existing run (train.py --continue_run); elapsed = its seconds so far."""
         self.config = config
+        self.start_time = time.time() - elapsed
+        if run_dir is not None:
+            self.run_dir, self.exp_id = Path(run_dir), Path(run_dir).name
+            print(f"Continuing experiment {self.exp_id} -> {self.run_dir}")
+            return
         self.exp_id = f"{run_name}-{datetime.now():%Y%m%d-%H%M%S}"
         self.run_dir = Path(root) / self.exp_id
         self.run_dir.mkdir(parents=True)
-        self.start_time = time.time()
 
         self.write_config(self.run_dir)
         with open(self.run_dir / "run.json", "w") as f:
@@ -36,7 +42,7 @@ class RunLogger:
         record = {"step": step, "time": round(time.time() - self.start_time, 1), **metrics}
         with open(self.run_dir / "metrics.jsonl", "a") as f:
             f.write(json.dumps(record) + "\n")
-        print(" | ".join(f"{k}={v:.4f}" if isinstance(v, float) else f"{k}={v}" for k, v in record.items()))
+        print(" | ".join(f"{k}={v:.4g}" if isinstance(v, float) else f"{k}={v}" for k, v in record.items()))  # .4g: 3e-05, not 0.0000
 
     def save_checkpoint(self, network, name="final", step=None):
         """A checkpoint folder is self-contained: copy it anywhere and load_checkpoint() rebuilds the network.
@@ -54,6 +60,26 @@ class RunLogger:
             json.dump({"exp_id": self.exp_id, "step": step, "architecture": architecture_name(self.config)}, f, indent=2)
         print(f"Saved checkpoint -> {ckpt_dir}")
         return ckpt_dir
+
+    def save_latest(self, network, training_state, step):
+        """checkpoints/latest = weights + training_state.pt (optimizer, LR schedule, data position...), enough to
+        continue the run exactly. Written to latest.tmp first and swapped in, so a crash mid-save keeps the old one."""
+        checkpoints = self.run_dir / "checkpoints"
+        tmp, latest, old = checkpoints / "latest.tmp", checkpoints / "latest", checkpoints / "latest.old"
+        for leftover in (tmp, old):
+            shutil.rmtree(leftover, ignore_errors=True)
+        weights = {k: p.detach().cpu().contiguous() for k, p in network.named_parameters() if p.requires_grad}
+        tmp.mkdir(parents=True)
+        save_file(weights, tmp / "weights.safetensors")
+        torch.save(training_state, tmp / "training_state.pt")
+        self.write_config(tmp)
+        with open(tmp / "meta.json", "w") as f:
+            json.dump({"exp_id": self.exp_id, "step": step, "architecture": architecture_name(self.config)}, f, indent=2)
+        if latest.exists():
+            latest.rename(old)
+        tmp.rename(latest)
+        shutil.rmtree(old, ignore_errors=True)
+        print(f"Saved resumable checkpoint -> {latest} (step {step})")
 
     def finish(self, **summary):
         summary["duration_sec"] = round(time.time() - self.start_time, 1)

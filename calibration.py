@@ -102,7 +102,7 @@ def main():
     device = get_device()
     network, config = load_checkpoint(args.checkpoint, device)
     arch, data = get_architecture(config), config["data"]
-    dataset = QuestionDataset(load_questions(args.split, args.max_questions), arch.encode_example,
+    dataset = QuestionDataset(load_questions(args.split, args.max_questions, task_types=data.get("task_types")), arch.encode_example,
                               data["max_state_tokens"], data["max_choice_tokens"])
     loader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size, collate_fn=arch.collate_fn)
     logits, labels, task_types = collect_logits(network, loader, device)

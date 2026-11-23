@@ -4,10 +4,11 @@ Nothing here contains model logic: it calls train.py, logger.py, calibration.py,
 inference.py, and adds plotting, printing and caching on top.
 
     Runs         train_or_load, latest_run, read_metrics
-    Data         show_question
+    Data         show_question, show_model_input
     Evaluation   evaluate_split (cached), free_memory
-    Inspection   parameter_table, layer_summary, draw_head_graph
+    Inspection   parameter_table, layer_summary, head_attention, plot_head_attention
     Plots        plot_training_curves, plot_calibration, plot_test_results
+    Analysis     baseline_table, plot_noul_threshold, plot_score_errors, accuracy_by, show_predictions, inference_speed
     Hands-on     ask
 """
 import gc
@@ -16,6 +17,7 @@ import time
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 import torch
 import yaml
@@ -78,6 +80,30 @@ def show_question(row, state_chars=300):
     print()
 
 
+def show_model_input(arch, row, data_config, max_context_chars=1500):
+    """Prints one question exactly as nbev reads it: the decoded packed sequence, block by block.
+
+    The context (task hint + question + state) is decoded from the real token ids, so a long state shows the
+    model's own head + "..." + tail truncation. Only for display, a context longer than max_context_chars
+    characters is shortened in the middle; the model itself reads every token of it."""
+    tokenizer = arch.tokenization.tokenizer
+    encoded = arch.encode_example(row["state"], row["instructions"], row["choices"], TASK_NAMES[row["task_type"]],
+                                  data_config["max_state_tokens"], data_config["max_choice_tokens"])
+    ids, positions, n = encoded["input_ids"], encoded["position_ids"], encoded["context_len"]
+    context = tokenizer.decode(ids[:n])
+    if len(context) > max_context_chars:
+        keep = max_context_chars // 2
+        context = (context[:keep] + f"\n      [... {len(context) - 2 * keep} characters not printed here, "
+                   f"but read by the model ...]\n" + context[-keep:])
+    print(f"=== {TASK_NAMES[row['task_type']]} | {len(ids)} tokens: context = positions 0..{n - 1}, "
+          f"{len(encoded['blocks'])} candidate blocks ===")
+    print(context)
+    for i, (start, end) in enumerate(encoded["blocks"]):
+        mark = "  <- correct answer" if i == row["label"] else ""
+        print(f"[OPT] {tokenizer.decode(ids[start + 1:end - 1])} [SEP]   (positions {positions[start]}..{positions[end - 1]}){mark}")
+    print()
+
+
 # ----------------------------------------------------------------------------------------- evaluation
 
 def free_memory():
@@ -96,8 +122,10 @@ def evaluate_split(network, config, ckpt_dir, split, max_questions, device, batc
     The result is cached as ckpt_dir/logits_<split>_<N>.pt, so running the notebook again does not
     recompute it. Metrics are computed from these outputs with metrics.compute_metrics.
     """
-    questions = load_questions(split, max_questions, config["seed"])
-    path = Path(ckpt_dir) / f"logits_{split}_{len(questions)}.pt"
+    task_types = config["data"].get("task_types")
+    questions = load_questions(split, max_questions, config["seed"], task_types)
+    suffix = "" if task_types is None else "_" + "-".join(task_types)
+    path = Path(ckpt_dir) / f"logits_{split}{suffix}_{len(questions)}.pt"
     if path.exists():
         return torch.load(path)
     arch, d = get_architecture(config), config["data"]
@@ -138,19 +166,52 @@ def layer_summary(network, batch, device, depth=4):
     print("\n".join(lines))
 
 
-def draw_head_graph(network, num_candidates=3):
-    """torchview + Graphviz drawing of the decision head: every operation with its tensor shapes.
-    Uses random candidate vectors for 2 questions (the second one with a padded, masked-out slot)."""
-    from torchview import draw_graph
-    H = network.backbone.config.hidden_size
-    mask = torch.ones(2, num_candidates, dtype=torch.bool)
-    mask[1, -1] = False
-    head = network.head
-    device = next(head.parameters()).device
-    graph = draw_graph(head.cpu(), input_data={"choice_embeddings": torch.randn(2, num_candidates, H), "choice_mask": mask},
-                       depth=3, expand_nested=True, graph_name=type(head).__name__)
-    head.to(device)
-    return graph.visual_graph
+@torch.no_grad()
+def head_attention(network, config, device, state, instructions, task_type, criteria=None):
+    """Runs one question and returns the decision head's attention between candidates, one [C, C] array per
+    head layer (row = the candidate that looks, column = the candidate it looks at; each row sums to 1).
+    The weights are recomputed from the inputs of each SelfAttention with its own q and k projections."""
+    from dataset import question_to_choices
+    from inference import autocast
+    question = {"type": task_type, "instructions": instructions}
+    if criteria is not None:
+        question["criteria"] = criteria
+    choices, _ = question_to_choices(question)
+    arch, d = get_architecture(config), config["data"]
+    example = arch.encode_example(state, instructions, choices, task_type, d["max_state_tokens"], d["max_choice_tokens"])
+    example.update(task_type=TASK_TYPES[task_type], label=None)
+    batch = to_device(arch.collate_fn([example]), device)
+
+    captured = []
+    def hook(module, inputs, output):
+        x, mask = inputs
+        scores = module.q(x) @ module.k(x).transpose(-1, -2) / module.new_dim ** 0.5
+        captured.append(torch.softmax(scores.masked_fill(~mask[:, None, :], -float("inf")), -1)[0].float().cpu().numpy())
+    handles = [layer.attn.register_forward_hook(hook) for layer in network.head.layers]
+    network.eval()
+    try:
+        with autocast(device):
+            network(**batch)
+    finally:
+        for h in handles:
+            h.remove()
+    return captured, choices
+
+
+def plot_head_attention(weights, choices):
+    """One heatmap per head layer from head_attention()."""
+    labels = [c if len(c) <= 25 else c[:24] + "…" for c in choices]
+    fig, axes = plt.subplots(1, len(weights), figsize=(4.6 * len(weights), 4), squeeze=False)
+    for i, (ax, w) in enumerate(zip(axes[0], weights)):
+        ax.imshow(w, cmap="Blues", vmin=0, vmax=1)
+        for r in range(len(w)):
+            for c in range(len(w)):
+                ax.text(c, r, f"{w[r, c]:.2f}", ha="center", va="center", color="white" if w[r, c] > 0.5 else "black")
+        ax.set_xticks(range(len(labels)), labels, rotation=30, ha="right")
+        ax.set_yticks(range(len(labels)), labels)
+        ax.set(title=f"head layer {i}: who looks at whom", xlabel="looked at (key)", ylabel="looking (query)")
+    plt.tight_layout()
+    plt.show()
 
 
 # ----------------------------------------------------------------------------------------- plots
@@ -160,15 +221,17 @@ def plot_training_curves(run_dir):
     history = read_metrics(run_dir)
     train, val = history["train"], history["validation"]
     best_step = json.loads((Path(run_dir) / "checkpoints" / "best" / "meta.json").read_text())["step"]
-    fig, axes = plt.subplots(1, 3, figsize=(16, 4))
+    tasks = [t for t in TASK_TYPES if any(f"accuracy_{t}" in r for r in val)]
+    per_task = len(tasks) > 1  # with a single task type, its accuracy is the overall one: no third panel
+    fig, axes = plt.subplots(1, 3 if per_task else 2, figsize=(16, 4) if per_task else (11, 4))
     for ax, key in [(axes[0], "loss"), (axes[1], "accuracy")]:
         ax.plot([r["step"] for r in train], [r[key] for r in train], label="train", alpha=0.8)
         ax.plot([r["step"] for r in val], [r[key] for r in val], "o-", label="validation")
         ax.set_title(key)
-    for task in TASK_TYPES:
-        points = [(r["step"], r[f"accuracy_{task}"]) for r in val if f"accuracy_{task}" in r]
-        axes[2].plot(*zip(*points), "o-", label=task)
-    axes[2].set_title("validation accuracy per task type")
+    if per_task:
+        for task in tasks:
+            axes[2].plot(*zip(*[(r["step"], r[f"accuracy_{task}"]) for r in val if f"accuracy_{task}" in r]), "o-", label=task)
+        axes[2].set_title("validation accuracy per task type")
     for ax in axes:
         ax.axvline(best_step, ls="--", c="grey", lw=1)
         ax.set_xlabel("optimizer step")
@@ -206,8 +269,8 @@ def plot_calibration(outputs, temperatures, title_suffix=""):
     """One reliability diagram per task type, before (T = 1) and after temperature scaling.
     On the diagonal = calibrated; below = over-confident; above = under-confident."""
     before, after = _calibration_points(outputs, 1.0), _calibration_points(outputs, temperatures)
-    fig, axes = plt.subplots(1, len(before), figsize=(5.3 * len(before), 4.5))
-    for ax, task in zip(axes, before):
+    fig, axes = plt.subplots(1, len(before), figsize=(5.3 * len(before), 4.5), squeeze=False)  # 2-d even for one task
+    for ax, task in zip(axes[0], before):
         p, y, xlabel, ylabel = before[task]
         _reliability_curve(ax, p, y, label="T = 1", alpha=0.5)
         _reliability_curve(ax, *after[task][:2], label=f"T = {temperatures[task]:.2f}")
@@ -235,6 +298,224 @@ def plot_test_results(outputs, metrics, temperatures):
     axes[1].legend()
     plt.tight_layout()
     plt.show()
+
+
+# ----------------------------------------------------------------------------------------- analysis
+
+def _probs(outputs, temperatures):
+    return torch.softmax(apply_temperature(outputs["logits"], outputs["task_types"], temperatures), -1)
+
+
+def _num_candidates(outputs):
+    return torch.isfinite(outputs["logits"]).sum(-1)
+
+
+def baseline_table(outputs, temperatures):
+    """Accuracy of the model next to what trivial strategies would get, per task type.
+
+    chance        pick a candidate at random: the mean of 1 / (number of candidates)
+    majority      always give the most frequent answer: "No" for noul; for score, the most frequent level of
+                  each scale size (counted on this same split, so it flatters the baseline)
+    For score, the ordinal quality is also shown: within-1 accuracy and MAE of the expected score,
+    next to the MAE of always predicting the middle of the scale."""
+    probs, labels, tasks, n_cand = _probs(outputs, temperatures), outputs["labels"], outputs["task_types"], _num_candidates(outputs)
+    prediction = probs.argmax(-1)
+    rows = []
+    for name, idx in TASK_TYPES.items():
+        m = tasks == idx
+        if not m.any():
+            continue
+        y, pred, c = labels[m], prediction[m], n_cand[m]
+        row = {"task": name, "questions": int(m.sum()), "model accuracy": (pred == y).float().mean().item(),
+               "chance": (1 / c.float()).mean().item()}
+        if name == "noul":
+            row["majority"] = max((y == 0).float().mean().item(), (y == 1).float().mean().item())
+        elif name == "score":
+            row["majority"] = sum(torch.bincount(y[c == k]).max().item() for k in c.unique()) / len(y)
+            expected = (probs[m] * torch.arange(probs.shape[1])).sum(-1)
+            row["within-1 accuracy"] = ((pred - y).abs() <= 1).float().mean().item()
+            row["MAE"] = (expected - y).abs().mean().item()
+            row["MAE of 'middle level'"] = ((c - 1) / 2 - y).abs().mean().item()
+        rows.append(row)
+    return pd.DataFrame(rows).set_index("task")
+
+
+def _binary_scores(p_yes, is_yes, threshold):
+    pred = p_yes >= threshold
+    tp, fp = (pred & is_yes).sum().item(), (pred & ~is_yes).sum().item()
+    fn, tn = (~pred & is_yes).sum().item(), (~pred & ~is_yes).sum().item()
+    precision, recall = tp / max(tp + fp, 1), tp / max(tp + fn, 1)
+    return {"threshold": threshold, "accuracy": (tp + tn) / len(pred),
+            "balanced accuracy": (recall + tn / max(tn + fp, 1)) / 2,
+            "precision (yes)": precision, "recall (yes)": recall,
+            "F1 (yes)": 2 * precision * recall / max(precision + recall, 1e-9), "predicted yes": pred.float().mean().item()}
+
+
+def plot_noul_threshold(calibration, test, temperatures):
+    """Yes/no decisions: how P(yes) separates the answers, and what a threshold other than 0.5 would do.
+
+    The accuracy reported everywhere else is the argmax over ["No", "Yes"], i.e. the threshold P(yes) >= 0.5.
+    Here thresholds are chosen on the CALIBRATION split (best accuracy, best F1 of "yes") and then applied,
+    unchanged, to the test split. Returns the table of test scores for each threshold."""
+    def p_and_y(outputs):
+        m = outputs["task_types"] == TASK_TYPES["noul"]
+        return _probs(outputs, temperatures)[m, 1], outputs["labels"][m].bool()
+    p_cal, y_cal = p_and_y(calibration)
+    p_test, y_test = p_and_y(test)
+    grid = np.round(np.arange(0.05, 0.951, 0.01), 2)
+    sweep = pd.DataFrame([_binary_scores(p_cal, y_cal, t) for t in grid])
+    chosen = {"argmax (0.5)": 0.5,
+              "best accuracy on calibration": float(sweep.loc[sweep["accuracy"].idxmax(), "threshold"]),
+              "best F1 (yes) on calibration": float(sweep.loc[sweep["F1 (yes)"].idxmax(), "threshold"])}
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 4.5))
+    bins = np.linspace(0, 1, 26)
+    axes[0].hist(p_test[~y_test].numpy(), bins, alpha=0.6, label=f"true answer No ({int((~y_test).sum())})")
+    axes[0].hist(p_test[y_test].numpy(), bins, alpha=0.6, label=f"true answer Yes ({int(y_test.sum())})")
+    axes[0].set(title="test: predicted P(yes), split by the true answer", xlabel="calibrated P(yes)", ylabel="questions")
+    for metric in ["accuracy", "balanced accuracy", "F1 (yes)"]:
+        axes[1].plot(sweep["threshold"], sweep[metric], label=metric)
+    axes[1].axhline(max(y_cal.float().mean().item(), 1 - y_cal.float().mean().item()), c="grey", ls=":", label="always No")
+    axes[1].set(title="calibration split: score of the rule P(yes) >= threshold", xlabel="threshold")
+    for ax in axes:
+        for (name, t), color in zip(chosen.items(), ["k", "C3", "C4"]):
+            ax.axvline(t, c=color, ls="--", lw=1)
+        ax.legend()
+        ax.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+    return pd.DataFrame({name: _binary_scores(p_test, y_test, t) for name, t in chosen.items()}).T
+
+
+def plot_score_errors(outputs, temperatures):
+    """Score questions: confusion matrix of the most probable level, and the distribution of (predicted - true)."""
+    m = outputs["task_types"] == TASK_TYPES["score"]
+    probs, y = _probs(outputs, temperatures)[m], outputs["labels"][m]
+    pred = probs.argmax(-1)
+    K = int(max(y.max(), pred.max())) + 1
+    confusion = np.zeros((K, K), dtype=int)
+    for t, p in zip(y.tolist(), pred.tolist()):
+        confusion[t, p] += 1
+    fig, axes = plt.subplots(1, 2, figsize=(13, 4.8))
+    axes[0].imshow(confusion / confusion.sum(1, keepdims=True).clip(min=1), cmap="Blues", vmin=0, vmax=1)
+    for t in range(K):
+        for p in range(K):
+            if confusion[t, p]:
+                axes[0].text(p, t, confusion[t, p], ha="center", va="center")
+    axes[0].set(title="score: true level (rows) vs most probable level (columns)\ncolour = share of the row",
+                xlabel="predicted level", ylabel="true level", xticks=range(K), yticks=range(K))
+    diff = (pred - y).numpy()
+    values, counts = np.unique(diff, return_counts=True)
+    axes[1].bar(values, counts / len(diff))
+    axes[1].set(title=f"predicted - true level  (exact {np.mean(diff == 0):.2f}, within 1 {np.mean(np.abs(diff) <= 1):.2f})",
+                xlabel="error in levels", ylabel="share of score questions")
+    axes[1].grid(alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+
+def accuracy_by(outputs, questions, key, temperatures, min_questions=5):
+    """Accuracy grouped by a question field ("domain" or "instructions"), with the chance level of each group.
+    questions must be the same split and size as outputs (as returned by load_questions), in the same order."""
+    hits = (_probs(outputs, temperatures).argmax(-1) == outputs["labels"]).float().numpy()
+    table = pd.DataFrame({key: questions[key], "task": [TASK_NAMES[t] for t in questions["task_type"]],
+                          "hit": hits, "chance": (1 / _num_candidates(outputs).float()).numpy()})
+    if key == "instructions":
+        table[key] = table[key].str.slice(0, 90)
+    grouped = table.groupby([key, "task"]).agg(questions=("hit", "size"), accuracy=("hit", "mean"), chance=("chance", "mean"))
+    grouped = grouped[grouped.questions >= min_questions]
+    return grouped.assign(gain=grouped.accuracy - grouped.chance).sort_values("questions", ascending=False)
+
+
+def show_predictions(outputs, questions, temperatures, n=4, mistakes=False, seed=0, state_chars=300):
+    """Prints n questions with the model's calibrated probabilities as bars (→ = correct answer).
+
+    mistakes=False: n random questions. mistakes=True: the n wrong answers the model was most confident about.
+    questions must be the same split and size as outputs (as returned by load_questions), in the same order.
+    A state longer than state_chars is printed as its start + " … " + its end."""
+    probs = _probs(outputs, temperatures)
+    confidence, prediction = probs.max(-1)
+    wrong = prediction != outputs["labels"]
+    if mistakes:
+        indices = [i for i in confidence.argsort(descending=True).tolist() if wrong[i]][:n]
+    else:
+        indices = torch.randperm(len(probs), generator=torch.Generator().manual_seed(seed))[:n].tolist()
+    for i in indices:
+        row = questions[i]
+        state = " ".join(row["state"].split())
+        if len(state) > state_chars:
+            head = 2 * state_chars // 3
+            state = state[:head] + " … " + state[-(state_chars - head):]
+        print(f"[{row['domain']}] {row['instructions']}")
+        print(f"   {'✗ wrong' if wrong[i] else '✓ right'}, confidence {confidence[i]:.2f}")
+        print(f"   state: {state}")
+        for j, choice in enumerate(row["choices"]):
+            print(f"   {'→' if j == row['label'] else ' '} {probs[i, j]:.3f}  {'█' * round(probs[i, j].item() * 30):<30}  {choice[:100]}")
+        print()
+
+
+def _sync(device):
+    if device.type == "mps":
+        torch.mps.synchronize()
+    elif device.type == "cuda":
+        torch.cuda.synchronize()
+
+
+@torch.no_grad()
+def inference_speed(network, config, device, questions, batch_sizes=(1, 8), num_questions=64,
+                    candidate_counts=(2, 4, 8, 16, 32), repeats=5):
+    """End-to-end inference time (tokenization + collate + one forward pass + softmax). Returns two tables:
+
+    by batch size        ms per question and questions per second on num_questions real questions, batched by length
+    by candidate count   ms for one question (batch 1) with 2 ... 32 candidates on the same state: one forward
+                         pass whatever the count, the context is encoded once and each candidate adds a short block
+    Every timed pass is first run once untimed: MPS / CUDA compile kernels for each new input shape.
+    """
+    from inference import autocast
+    arch, d = get_architecture(config), config["data"]
+    network.eval()
+
+    def run(rows):
+        examples = []
+        for r in rows:
+            ex = arch.encode_example(r["state"], r["instructions"], r["choices"], TASK_NAMES[r["task_type"]],
+                                     d["max_state_tokens"], d["max_choice_tokens"])
+            ex.update(task_type=r["task_type"], label=r.get("label"))
+            examples.append(ex)
+        with autocast(device):
+            torch.softmax(network(**to_device(arch.collate_fn(examples), device)).float(), -1).cpu()
+        return sum(len(ex["input_ids"]) for ex in examples)
+
+    # Batches of similar length, as in training: a batch is padded to its longest question
+    rows = sorted((questions[i] for i in range(min(num_questions, len(questions)))), key=lambda r: len(r["state"]))
+    by_batch = []
+    for bs in batch_sizes:
+        batches = [rows[i:i + bs] for i in range(0, len(rows), bs)]
+        tokens = sum(run(batch) for batch in batches)     # warm-up on every shape
+        _sync(device)
+        start = time.perf_counter()
+        for batch in batches:
+            run(batch)
+        _sync(device)
+        seconds = (time.perf_counter() - start) / len(rows)
+        by_batch.append({"batch size": bs, "ms per question": 1000 * seconds, "questions per second": 1 / seconds,
+                         "mean tokens per question": tokens / len(rows)})
+
+    state = rows[len(rows) // 2]["state"]                 # a state of median length
+    by_count = []
+    for count in candidate_counts:
+        row = {"state": state, "instructions": "Which option fits best?", "task_type": TASK_TYPES["choice"],
+               "choices": [f"option {i}: a short description of choice number {i}" for i in range(count)]}
+        tokens = run([row])                               # warm-up
+        times = []
+        for _ in range(repeats):
+            _sync(device)
+            start = time.perf_counter()
+            run([row])
+            _sync(device)
+            times.append(time.perf_counter() - start)
+        by_count.append({"candidates": count, "tokens": tokens, "ms per question": 1000 * float(np.median(times))})
+    return pd.DataFrame(by_batch).set_index("batch size"), pd.DataFrame(by_count).set_index("candidates")
 
 
 # ----------------------------------------------------------------------------------------- hands-on
