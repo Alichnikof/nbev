@@ -1,4 +1,4 @@
-# Long run: nbev on ALL the multiple-choice training questions (~98K after the held-out splits), one epoch.
+# Long run: nbev on ALL the `choice` training questions (~98K after the held-out splits), one epoch.
 #   caffeinate -i uv run python train.py configs/choice_full.yaml --name nbev-choice-full
 # (caffeinate -i keeps the Mac awake while the run lasts.) Same model and settings as choice_walkthrough.yaml,
 # except the data size and a sparser, larger validation: all ~2,000 validation questions every 500 steps.
@@ -12,7 +12,7 @@ model:
   full_finetune: true
 
 data:
-  task_types: [choice]          # only multiple-choice questions (null or absent = all three types)
+  task_types: [choice]          # only `choice` questions (null or absent = all three types)
   max_train_questions: null     # all of them
   max_test_questions: null      # all ~2,000 held-out validation questions, to pick the best checkpoint
   eval_split: validation        # calibration and test splits stay untouched during training

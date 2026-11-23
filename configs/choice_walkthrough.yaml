@@ -19,7 +19,7 @@ model:
   full_finetune: true
 
 data:
-  task_types: [choice]          # only multiple-choice questions (null or absent = all three types)
+  task_types: [choice]          # only `choice` questions (null or absent = all three types)
   max_train_questions: 10000
   max_test_questions: 500       # questions of the eval split used to pick the best checkpoint
   eval_split: validation        # calibration and test splits stay untouched during training

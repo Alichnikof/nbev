@@ -4,7 +4,7 @@ nbev ("new BEV") picks the best answer to a question about a conversation: route
 
 It started from [BEV](https://github.com/avbiswas/bev-train) by Avishek Biswas, which does this with a Qwen3 decoder. nbev takes BEV's order-invariance trick to an encoder-only model, adds a calibration and evaluation pipeline, and keeps the original Qwen model as a benchmark. See [What comes from BEV, what is new](#what-comes-from-bev-what-is-new).
 
-**Start here:** [`choice_walkthrough.ipynb`](choice_walkthrough.ipynb) walks through nbev trained on all ~98K multiple-choice questions: data, model, training, calibration, test results, example predictions, and questions of your own. See [Quick start](#quick-start).
+**Start here:** [`choice_walkthrough.ipynb`](choice_walkthrough.ipynb) walks through nbev trained on all ~98K `choice` questions: data, model, training, calibration, test results, example predictions, and questions of your own. See [Quick start](#quick-start).
 
 ![nbev packed sequence and attention mask](assets/nbev_packing.png)
 
@@ -22,7 +22,7 @@ All three use the same model, so the candidates can be any text of any length an
 
 The results below are on `choice` questions. The code handles all three types, but so far only the choice model has been trained long enough to report.
 
-## Results: multiple choice
+## Results: `choice` questions
 
 nbev (DeBERTa-v3-base, fully fine-tuned) was trained on all 98,085 `choice` training questions for one epoch: 6,130 optimizer steps of 16 questions, 2.1 h on a MacBook (M5 Pro, MPS), with [`configs/choice_full.yaml`](configs/choice_full.yaml). The test questions were never seen in training, checkpoint selection or calibration.
 
@@ -207,7 +207,7 @@ done
 ## Repository layout
 
 ```
-choice_walkthrough.ipynb         entry point: the trained multiple-choice model
+choice_walkthrough.ipynb         entry point: the trained `choice` model
 deberta_full_walkthrough.ipynb   older walkthrough, all three task types (not up to date)
 architectures/
   nbev/            packed DeBERTa encoder (this project): tokenization.py, network.py
