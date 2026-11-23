@@ -4,7 +4,7 @@ Nothing here contains model logic: it calls train.py, logger.py, calibration.py,
 inference.py, and adds plotting, printing and caching on top.
 
     Runs         train_or_load, latest_run, read_metrics
-    Data         show_question, show_model_input
+    Data         show_question, show_model_input, plot_attention_mask
     Evaluation   evaluate_split (cached), free_memory
     Inspection   parameter_table, layer_summary, head_attention, plot_head_attention
     Plots        plot_training_curves, plot_calibration, plot_test_results
@@ -102,6 +102,80 @@ def show_model_input(arch, row, data_config, max_context_chars=1500):
         mark = "  <- correct answer" if i == row["label"] else ""
         print(f"[OPT] {tokenizer.decode(ids[start + 1:end - 1])} [SEP]   (positions {positions[start]}..{positions[end - 1]}){mark}")
     print()
+
+
+MASK_COLORS = ["#9aa5b1", "#3b82f6", "#f59e0b", "#10b981", "#ef4444", "#8b5cf6", "#ec4899", "#14b8a6", "#a16207",
+               "#6366f1", "#84cc16"]  # grey = context, then one colour per option
+
+
+def _block_name(tokenizer, ids, start, end, chars=18):
+    """Short name of an option block: its decoded text up to the first ":" (dataset options are "key: description")."""
+    text = tokenizer.decode(ids[start + 1:end - 1]).split(":")[0].strip()
+    return text if len(text) <= chars else text[:chars - 1] + "…"
+
+
+def plot_attention_mask(arch, examples, titles, max_labelled_tokens=60):
+    """Draws the attention mask of encoded questions (outputs of arch.encode_example), side by side, and returns a
+    table that checks the masking rules on each of them.
+
+    Row = the token doing the looking (query), column = the token being looked at (key). An allowed cell takes the
+    colour of the key's owner (grey = context, one colour per option); white = blocked. A sequence of at most
+    max_labelled_tokens gets one label per token, "token (position id)"; a longer one gets one label per block."""
+    from matplotlib.colors import ListedColormap
+    tokenization = arch.tokenization
+    tokenizer = tokenization.tokenizer
+    fig, axes = plt.subplots(1, len(examples), figsize=(8.5 * len(examples), 8.8), squeeze=False)
+    checks = {}
+    for ax, example, title in zip(axes[0], examples, titles):
+        ids, positions, n, blocks = example["input_ids"], example["position_ids"], example["context_len"], example["blocks"]
+        L = len(ids)
+        mask = tokenization.attention_mask_for(example, L)
+        owner = np.zeros(L, dtype=int)  # 0 = context, i = option i
+        for i, (start, end) in enumerate(blocks, 1):
+            owner[start:end] = i
+        colors = [MASK_COLORS[0]] + [MASK_COLORS[1 + i % (len(MASK_COLORS) - 1)] for i in range(len(blocks))]
+        grid = np.where(mask.numpy(), owner[None, :] + 1, 0)
+        ax.imshow(grid, cmap=ListedColormap(["white", *colors]), vmin=-0.5, vmax=len(colors) + 0.5,
+                  interpolation="nearest")
+        if L <= max_labelled_tokens:
+            token = lambda t: "[OPT]" if t == tokenization.OPT_TOKEN_ID else tokenizer.convert_ids_to_tokens(t).replace("▁", "")
+            ticks, labels = list(range(L)), [f"{token(t)}  ({p})" for t, p in zip(ids, positions)]
+            tick_owner = owner
+            ax.set_xticks(np.arange(L + 1) - 0.5, minor=True)
+            ax.set_yticks(np.arange(L + 1) - 0.5, minor=True)
+            ax.grid(which="minor", color="#e4e7eb", lw=0.5)
+            ax.tick_params(which="minor", length=0)
+        else:
+            ticks = [(n - 1) / 2] + [(start + end - 1) / 2 for start, end in blocks]
+            labels = [f"context (positions 0..{n - 1})"] + [
+                f"{_block_name(tokenizer, ids, start, end)} ({positions[start]}..{positions[end - 1]})" for start, end in blocks]
+            tick_owner = range(len(blocks) + 1)
+            for boundary in [n] + [start for start, _ in blocks[1:]]:
+                ax.axhline(boundary - 0.5, color="#cbd2d9", lw=0.6)
+                ax.axvline(boundary - 0.5, color="#cbd2d9", lw=0.6)
+        fontsize = 7 if L <= max_labelled_tokens else 9
+        ax.set_xticks(ticks, labels, rotation=90, fontsize=fontsize)
+        ax.set_yticks(ticks, labels, fontsize=fontsize)
+        for tick_labels in (ax.get_xticklabels(), ax.get_yticklabels()):
+            for label, o in zip(tick_labels, tick_owner):
+                label.set_color(colors[o] if o else "#3e4c59")
+        ax.set_xlabel("key: the token being looked at")
+        ax.set_ylabel("query: the token doing the looking")
+        ax.set_title(title, fontsize=10)
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+
+        others = [mask[a0:a1, b0:b1].any() for i, (a0, a1) in enumerate(blocks) for j, (b0, b1) in enumerate(blocks) if i != j]
+        checks[title.split(":")[0]] = {
+            "tokens": L, "options": len(blocks),
+            "context sees an option": bool(mask[:n, n:].any()),
+            "an option sees another option": bool(any(others)),
+            "every option sees the whole context": all(bool(mask[a0:a1, :n].all()) for a0, a1 in blocks),
+            "every option starts at position": ", ".join(sorted({str(positions[a0]) for a0, _ in blocks})),
+        }
+    plt.tight_layout()
+    plt.show()
+    return pd.DataFrame(checks).T
 
 
 # ----------------------------------------------------------------------------------------- evaluation
@@ -427,19 +501,33 @@ def accuracy_by(outputs, questions, key, temperatures, min_questions=5):
     return grouped.assign(gain=grouped.accuracy - grouped.chance).sort_values("questions", ascending=False)
 
 
-def show_predictions(outputs, questions, temperatures, n=4, mistakes=False, seed=0, state_chars=300):
+def show_predictions(outputs, questions, temperatures, n=4, mistakes=False, successes=False, min_confidence=0.7,
+                     seed=0, state_chars=300):
     """Prints n questions with the model's calibrated probabilities as bars (→ = correct answer).
 
-    mistakes=False: n random questions. mistakes=True: the n wrong answers the model was most confident about.
+    Default: n random questions. mistakes=True: the n wrong answers the model was most confident about.
+    successes=True: n right answers given with at least min_confidence, one per domain (largest domains first),
+    picked at random within the domain, after a line saying how often the model is that confident and right.
     questions must be the same split and size as outputs (as returned by load_questions), in the same order.
     A state longer than state_chars is printed as its start + " … " + its end."""
     probs = _probs(outputs, temperatures)
     confidence, prediction = probs.max(-1)
     wrong = prediction != outputs["labels"]
+    order = torch.randperm(len(probs), generator=torch.Generator().manual_seed(seed)).tolist()
     if mistakes:
         indices = [i for i in confidence.argsort(descending=True).tolist() if wrong[i]][:n]
+    elif successes:
+        confident = confidence >= min_confidence
+        print(f"{confident.float().mean():.0%} of the {len(probs)} questions are answered with confidence ≥ "
+              f"{min_confidence}, and {(~wrong[confident]).float().mean():.0%} of those answers are right.\n")
+        domains = pd.Series(questions["domain"])
+        first_right = {}  # domain -> a random confident right answer in it
+        for i in order:
+            if confident[i] and not wrong[i]:
+                first_right.setdefault(domains[i], i)
+        indices = [first_right[domain] for domain in domains.value_counts().index if domain in first_right][:n]
     else:
-        indices = torch.randperm(len(probs), generator=torch.Generator().manual_seed(seed))[:n].tolist()
+        indices = order[:n]
     for i in indices:
         row = questions[i]
         state = " ".join(row["state"].split())

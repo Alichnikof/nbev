@@ -36,7 +36,8 @@ nbev (DeBERTa-v3-base, fully fine-tuned) was trained on all 98,085 `choice` trai
 
 - **Training:** validation NLL falls at almost every check, and accuracy levels off around 0.70 from step ~4,000 as the cosine schedule takes the learning rate to 0. The best checkpoint (lowest validation NLL) is the last one. A pilot on 10K choice questions ([`configs/choice_walkthrough.yaml`](configs/choice_walkthrough.yaml)) reached 0.62 on the same test questions, so 10× more data gave about +9 points.
 - **Calibration:** one temperature, T = 1.25, fitted on 1,943 calibration questions. T > 1 means the raw model was slightly over-confident. After scaling, an answer given with 70% confidence is right about 70% of the time. Accuracy is unchanged.
-- **Speed:** 28 ms per question end to end (tokenization, one forward pass, softmax), about 36 questions per second on MPS. The context is encoded once, so a question takes 12 ms with 2 options and 86 ms with 32.
+- **When it is sure, it is right:** 54% of the test questions get an answer with at least 70% confidence, and 94% of those answers are right.
+- **Speed:** about 28 ms per question end to end (tokenization, one forward pass, softmax), about 36 questions per second on MPS. The context is encoded once, so a question takes about 13 ms with 2 options and 85 ms with 32.
 - **Order invariance** is exact up to floating-point rounding, and [`tests/test_nbev.py`](tests/test_nbev.py) checks it.
 
 <img src="assets/choice_calibration.png" alt="reliability diagram on the test split" width="420">
@@ -89,8 +90,8 @@ uv run python inference.py runs/nbev-choice-full-<timestamp>/checkpoints/best --
 
 | Notebook | What it covers |
 |---|---|
-| [`choice_walkthrough.ipynb`](choice_walkthrough.ipynb) (**entry point**) | The trained choice model: data and splits, the packed input, training curves, parameters layer by layer, calibration, test results by domain and by number of options, inference speed, predictions and the most confident mistakes, and `ask(...)` for your own questions |
-| [`deberta_full_walkthrough.ipynb`](deberta_full_walkthrough.ipynb) | The architecture step by step on all three question types: the packed encoding, what the model reads, the attention mask. Its training run ([`configs/deberta_walkthrough.yaml`](configs/deberta_walkthrough.yaml)) is a short demo, not a result |
+| [`choice_walkthrough.ipynb`](choice_walkthrough.ipynb) (**entry point**) | The trained choice model: how to read the metrics (accuracy, NLL, ECE, temperature), data and splits, the packed input and its attention mask, training curves, parameters layer by layer, calibration, test results by domain and by number of options, inference speed, predictions (successes and the most confident mistakes), and `ask(...)` for your own questions |
+| [`deberta_full_walkthrough.ipynb`](deberta_full_walkthrough.ipynb) | Older walkthrough on all three question types with a short demo run ([`configs/deberta_walkthrough.yaml`](configs/deberta_walkthrough.yaml)). Not up to date: the choice notebook replaces it for now |
 | [`arch.ipynb`](arch.ipynb) | The original BEV livestream walkthrough ([video](https://youtube.com/live/AzxoU7kxjig)) |
 
 ### Training options
@@ -207,7 +208,7 @@ done
 
 ```
 choice_walkthrough.ipynb         entry point: the trained multiple-choice model
-deberta_full_walkthrough.ipynb   the architecture step by step, all three task types
+deberta_full_walkthrough.ipynb   older walkthrough, all three task types (not up to date)
 architectures/
   nbev/            packed DeBERTa encoder (this project): tokenization.py, network.py
   deberta_cross/   DeBERTa cross-encoder baseline
