@@ -12,7 +12,7 @@ deberta_cross  DeBERTa encoder (bidirectional). ONE sequence per (question, choi
                The context is re-encoded for every choice (cross-encoder).
                Choice embedding = [CLS] or the mean of the choice tokens (config: model.pooling).
 
-nbev           "new BEV": DeBERTa encoder (bidirectional). ONE sequence per question, BEV-style:
+nbev           "not-bev": DeBERTa encoder (bidirectional). ONE sequence per question, BEV-style:
                    [CLS] question+state [SEP] [OPT] A [SEP] [OPT] B [SEP] ...
                Choices share positions and are masked from each other, so the context is encoded once
                and the result does not depend on choice order.
