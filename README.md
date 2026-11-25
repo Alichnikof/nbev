@@ -77,6 +77,7 @@ Then open [`choice_walkthrough.ipynb`](choice_walkthrough.ipynb). It loads the l
 
 - `caffeinate -i` keeps a Mac awake while the run lasts; drop it on other systems. The code picks CUDA, then Apple MPS, then CPU. The first run downloads the model and the dataset.
 - A run that stops continues where it left off: `uv run python train.py configs/choice_full.yaml --continue_run runs/nbev-choice-full-<timestamp>`. `checkpoints/latest` (weights, optimizer, LR schedule, data position) is saved every 500 steps.
+- Section 8 of the notebook also asks Jev and OpenAI: copy [`.env.example`](.env.example) to `.env` and add `AIMLAPI_KEY` and `OPENAI_API_KEY`.
 - For a 25–30 min run on 10K questions, train [`configs/choice_walkthrough.yaml`](configs/choice_walkthrough.yaml) and set `CONFIG_PATH` and `RUN_NAME` in the notebook's first cell.
 
 The same steps without the notebook:
@@ -90,7 +91,7 @@ uv run python inference.py runs/nbev-choice-full-<timestamp>/checkpoints/best --
 
 | Notebook | What it covers |
 |---|---|
-| [`choice_walkthrough.ipynb`](choice_walkthrough.ipynb) (**entry point**) | The trained choice model: how to read the metrics (accuracy, NLL, ECE, temperature), data and splits, the packed input and its attention mask, training curves, parameters layer by layer, calibration, test results by domain and by number of options, inference speed, predictions (successes and the most confident mistakes), and `ask(...)` for your own questions |
+| [`choice_walkthrough.ipynb`](choice_walkthrough.ipynb) (**entry point**) | The trained choice model: how to read the metrics (accuracy, NLL, ECE, temperature), data and splits, the packed input and its attention mask, training curves, parameters layer by layer, calibration, test results by domain and by number of options, inference speed, predictions (successes and the most confident mistakes), the same question asked to nbev, Jev and OpenAI, and `ask(...)` for your own questions |
 | [`deberta_full_walkthrough.ipynb`](deberta_full_walkthrough.ipynb) | Older walkthrough on all three question types with a short demo run ([`configs/deberta_walkthrough.yaml`](configs/deberta_walkthrough.yaml)). Not up to date: the choice notebook replaces it for now |
 | [`arch.ipynb`](arch.ipynb) | The original BEV livestream walkthrough ([video](https://youtube.com/live/AzxoU7kxjig)) |
 
@@ -221,6 +222,7 @@ calibration.py     per-task temperature scaling
 metrics.py         per-task metrics (NLL, AUC, Brier, ECE, MAE)
 inference.py       evaluation and answer()
 notebook_utils.py  notebook helpers: plots, cached evaluation, predictions, ask()
+providers.py       the same question to nbev, Jev and OpenAI
 configs/           training configs (choice_full = the reported run, compare/ = like-for-like benchmark)
 tests/             invariance, isolation and patch tests
 scripts/           README figures

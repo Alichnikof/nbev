@@ -74,7 +74,7 @@ def read_metrics(run_dir):
 def show_question(row, state_chars=300):
     """Prints one dataset question: type, instructions, start of the state, candidates (→ = correct)."""
     print(f"[{TASK_NAMES[row['task_type']]}] {row['instructions']}")
-    print("   state:", row["state"][:state_chars].replace("\n", " "), "…")
+    print("   state:", row["state"][:state_chars].replace("\n", " ") + (" …" if len(row["state"]) > state_chars else ""))
     for i, choice in enumerate(row["choices"]):
         print(f"   {'→' if i == row['label'] else ' '} {i}. {choice[:110]}")
     print()
