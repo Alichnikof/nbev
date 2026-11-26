@@ -1,4 +1,4 @@
-"""Asks one choice question to nbev, Jev (TypeSafe, via AIML API) and OpenAI's Decisions API. Keys are read from .env."""
+"""Asks one choice question to not-bev, Jev (TypeSafe, via AIML API) and OpenAI's Decisions API. Keys are read from .env."""
 import time
 from functools import cache
 from pathlib import Path
@@ -52,7 +52,7 @@ def from_dataset(row):
 
 
 def ask_all(network, config, device, state, instructions, criteria):
-    models = {"nbev": lambda: ask_nbev(network, config, device, state, instructions, criteria),
+    models = {"not-bev": lambda: ask_nbev(network, config, device, state, instructions, criteria),
               "Jev": lambda: ask_jev(state, instructions, criteria),
               "OpenAI": lambda: ask_openai(state, instructions, criteria)}
     for name, ask in models.items():

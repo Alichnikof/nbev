@@ -1,12 +1,12 @@
-# nbev (not-bev): order-invariant multiple-choice decisions with a bidirectional encoder
+# not-bev: order-invariant multiple-choice decisions with a bidirectional encoder
 
-nbev picks the best answer to a question about a conversation: route a support ticket to the right team, say yes or no, give a 1–5 score. It reads the question, the conversation and **every candidate answer in one DeBERTa-v3 pass**. It returns one **calibrated** probability per candidate, and the result does not depend on the order in which the candidates are listed.
+Given a question about a conversation, not-bev picks the best answer: route a support ticket to the right team, say yes or no, give a 1–5 score. It reads the question, the conversation and **every candidate answer in one DeBERTa-v3 pass**. It returns one **calibrated** probability per candidate, and the result does not depend on the order in which the candidates are listed.
 
-It started from [BEV](https://github.com/avbiswas/bev-train) by Avishek Biswas, which does this with a Qwen3 decoder. The name says how the two relate: **not-bev** is BEV's idea, not BEV's model. It takes BEV's order-invariance trick to a bidirectional encoder instead of a decoder, adds a calibration and evaluation pipeline, and keeps the original Qwen model as a benchmark. See [What comes from BEV, what is new](#what-comes-from-bev-what-is-new).
+It started from [BEV](https://github.com/avbiswas/bev-train) by Avishek Biswas, which does this with a Qwen3 decoder. The name says how the two relate: **not-bev** is BEV's idea, not BEV's model. Its code name, in paths and configs, is `nbev`. It takes BEV's order-invariance trick to a bidirectional encoder instead of a decoder, adds a calibration and evaluation pipeline, and keeps the original Qwen model as a benchmark. See [What comes from BEV, what is new](#what-comes-from-bev-what-is-new).
 
-**Start here:** [`choice_walkthrough.ipynb`](choice_walkthrough.ipynb) walks through nbev trained on all ~98K `choice` questions: data, model, training, calibration, test results, example predictions, and questions of your own. See [Quick start](#quick-start).
+**Start here:** [`choice_walkthrough.ipynb`](choice_walkthrough.ipynb) walks through not-bev trained on all ~98K `choice` questions: data, model, training, calibration, test results, example predictions, and questions of your own. See [Quick start](#quick-start).
 
-![nbev packed sequence and attention mask](assets/nbev_packing.png)
+![not-bev packed sequence and attention mask](assets/nbev_packing.png)
 
 ## The task
 
@@ -24,9 +24,9 @@ The results below are on `choice` questions. The code handles all three types, b
 
 ## Results: `choice` questions
 
-nbev (DeBERTa-v3-base, fully fine-tuned) was trained on all 98,085 `choice` training questions for one epoch: 6,130 optimizer steps of 16 questions, 2.1 h on a MacBook (M5 Pro, MPS), with [`configs/choice_full.yaml`](configs/choice_full.yaml). The test questions were never seen in training, checkpoint selection or calibration.
+The reported not-bev model (DeBERTa-v3-base, fully fine-tuned) was trained on all 98,085 `choice` training questions for one epoch: 6,130 optimizer steps of 16 questions, 2.1 h on a MacBook (M5 Pro, MPS), with [`configs/choice_full.yaml`](configs/choice_full.yaml). The test questions were never seen in training, checkpoint selection or calibration.
 
-| Test (5,000 choice questions, 2 to 10 options) | nbev | Chance |
+| Test (5,000 choice questions, 2 to 10 options) | not-bev | Chance |
 |---|---|---|
 | Accuracy | **0.708** (± 0.013 at 95%) | 0.26 |
 | NLL | 0.672 | |
@@ -91,7 +91,7 @@ uv run python inference.py runs/nbev-choice-full-<timestamp>/checkpoints/best --
 
 | Notebook | What it covers |
 |---|---|
-| [`choice_walkthrough.ipynb`](choice_walkthrough.ipynb) (**entry point**) | The trained choice model: how to read the metrics (accuracy, NLL, ECE, temperature), data and splits, the packed input and its attention mask, training curves, parameters layer by layer, calibration, test results by domain and by number of options, inference speed, predictions (successes and the most confident mistakes), the same question asked to nbev, Jev and OpenAI, and `ask(...)` for your own questions |
+| [`choice_walkthrough.ipynb`](choice_walkthrough.ipynb) (**entry point**) | The trained choice model: how to read the metrics (accuracy, NLL, ECE, temperature), data and splits, the packed input and its attention mask, training curves, parameters layer by layer, calibration, test results by domain and by number of options, inference speed, predictions (successes and the most confident mistakes), the same question asked to not-bev, Jev and OpenAI, and `ask(...)` for your own questions |
 | [`deberta_full_walkthrough.ipynb`](deberta_full_walkthrough.ipynb) | Older walkthrough on all three question types with a short demo run ([`configs/deberta_walkthrough.yaml`](configs/deberta_walkthrough.yaml)). Not up to date: the choice notebook replaces it for now |
 | [`arch.ipynb`](arch.ipynb) | The original BEV livestream walkthrough ([video](https://youtube.com/live/AzxoU7kxjig)) |
 
@@ -103,7 +103,7 @@ uv run python inference.py runs/nbev-choice-full-<timestamp>/checkpoints/best --
 - `data.group_by_length: true` batches questions of similar length;
 - `optim.grad_accum_steps` sets gradient accumulation.
 
-## How nbev works
+## How not-bev works
 
 ### 1. One packed sequence per question
 
@@ -112,7 +112,7 @@ uv run python inference.py runs/nbev-choice-full-<timestamp>/checkpoints/best --
 positions:  0 ...................... n-1    n    n+1 n+2         n    n+1  n+2    n+3      n    n+1  n+2
 ```
 
-A cross-encoder builds one sequence per candidate (`[CLS] context [SEP] candidate [SEP]`), so a 4-candidate question re-encodes the same 448-token context 4 times. nbev puts the context once, followed by every candidate block. Code: [`architectures/nbev/tokenization.py`](architectures/nbev/tokenization.py).
+A cross-encoder builds one sequence per candidate (`[CLS] context [SEP] candidate [SEP]`), so a 4-candidate question re-encodes the same 448-token context 4 times. not-bev puts the context once, followed by every candidate block. Code: [`architectures/nbev/tokenization.py`](architectures/nbev/tokenization.py).
 
 ### 2. Shared positions: order invariance
 
@@ -177,7 +177,7 @@ uv run python -m tests.test_nbev
 
 `model.architecture` selects the encoder. Data, prompts, training loop, calibration and metrics are shared, so the comparison is like for like:
 
-| | `qwen_bev` (original BEV) | `deberta_cross` | `nbev` (this project) |
+| | `qwen_bev` (original BEV) | `deberta_cross` | `nbev` (not-bev, this project) |
 |---|---|---|---|
 | Backbone | Qwen3-0.6B decoder (causal), LoRA | DeBERTa-v3 encoder, full fine-tune | DeBERTa-v3 encoder, full fine-tune |
 | Sequences per question | 1 | 1 per candidate | 1 |
@@ -196,10 +196,10 @@ done
 
 ## What comes from BEV, what is new
 
-| From [BEV](https://github.com/avbiswas/bev-train) (Avishek Biswas) | New in nbev |
+| From [BEV](https://github.com/avbiswas/bev-train) (Avishek Biswas) | New in not-bev |
 |---|---|
 | The idea of packing all candidates into one sequence with shared positions and a mask | Moving it to a **bidirectional encoder**, and the analysis of why positions give invariance but the mask is still needed |
-| The Qwen3 decoder model (`qwen_bev`), kept as the benchmark | The `nbev` encoder: `[OPT]` token pooling and the DeBERTa-v3 **relative-position patch** |
+| The Qwen3 decoder model (`qwen_bev`), kept as the benchmark | The not-bev encoder: `[OPT]` token pooling and the DeBERTa-v3 **relative-position patch** |
 | The dataset, task types and prompt format | The `deberta_cross` cross-encoder baseline and the shared `architectures/` package |
 | The `bilinear_answer` decision head and the training loop | The `candidate_mlp` head |
 | Data loading, logging, inference | **Calibration**: leak-free validation/calibration splits, per-task temperature scaling, ECE/Brier/AUC metrics, selection by NLL. BEV picked its best checkpoint by accuracy on the test split, which inflates the test number; here test is never seen before the end |
@@ -222,7 +222,7 @@ calibration.py     per-task temperature scaling
 metrics.py         per-task metrics (NLL, AUC, Brier, ECE, MAE)
 inference.py       evaluation and answer()
 notebook_utils.py  notebook helpers: plots, cached evaluation, predictions, ask()
-providers.py       the same question to nbev, Jev and OpenAI
+providers.py       the same question to not-bev, Jev and OpenAI
 configs/           training configs (choice_full = the reported run, compare/ = like-for-like benchmark)
 tests/             invariance, isolation and patch tests
 scripts/           README figures
